@@ -294,8 +294,19 @@ class FocalCapPhase2(nn.Module):
         motion_encoder: nn.Module,
         clip_state_dict: Optional[Any] = None,
         use_lora: bool = True,
+        block_dropout_p: float = 0.0,
+        attn_probe_every: int = 200,
     ):
         super().__init__()
+
+        # Probabilistic block dropout (CLS / Action / Patch). 0.0 = disabled.
+        # Set to e.g. 0.15 if attribution metrics show GPT-2 is reading mostly
+        # one block; this forces it to use all three.
+        self.block_dropout_p = float(block_dropout_p)
+        # Compute caption→visual attention attribution every N forward passes.
+        # 0 disables. 200 is roughly once every ~7s on this hardware, negligible.
+        self.attn_probe_every = int(attn_probe_every)
+        self._fwd_step = 0
 
         self.motion_encoder = motion_encoder
         # Phase-2 must discard Phase-1 teacher heads.
@@ -523,6 +534,32 @@ class FocalCapPhase2(nn.Module):
             patch_gop_ids=routed["patch_gop_ids"],
         )
 
+        # Post-projection magnitude probe — tells you whether GPT-2 even SEES
+        # each block. If patch_norm collapses near 0, the AGDTR sigmoid gates
+        # have shut and GPT-2 only reads CLS+Action. If action_norm_post is
+        # tiny, the Modality Projector has zeroed out the action stream.
+        with torch.no_grad():
+            cls_block = visual[:, :gops, :]
+            act_block = visual[:, gops:gops + gops * 8, :]
+            patch_block = visual[:, gops + gops * 8:, :]
+            cls_norm_post = cls_block.float().norm(dim=-1).mean()
+            act_norm_post = act_block.float().norm(dim=-1).mean()
+            patch_norm_post = patch_block.float().norm(dim=-1).mean()
+
+        # Optional block-dropout: during training, randomly suppress one block
+        # type so GPT-2 cannot collapse to relying on a single source. Default
+        # off (p=0); flip via base.yaml if attribution metrics show dominance.
+        if self.training and self.block_dropout_p > 0.0:
+            r = torch.rand(1, device=visual.device).item()
+            if r < self.block_dropout_p:
+                which = int(torch.randint(0, 3, (1,)).item())
+                if which == 0:
+                    visual = torch.cat([torch.zeros_like(cls_block), act_block, patch_block], dim=1)
+                elif which == 1:
+                    visual = torch.cat([cls_block, torch.zeros_like(act_block), patch_block], dim=1)
+                else:
+                    visual = torch.cat([cls_block, act_block, torch.zeros_like(patch_block)], dim=1)
+
         vis_end = self.vis_end.expand(bsz, -1, -1)
 
         bos_id = self.gpt2.config.bos_token_id
@@ -545,7 +582,37 @@ class FocalCapPhase2(nn.Module):
         ], dim=1)
         full_labels = torch.cat([ignore_prefix, text_labels], dim=1)
 
-        out = self.gpt2(inputs_embeds=inputs_embeds, attention_mask=full_mask, return_dict=True)
+        request_attn = self.training and self.attn_probe_every > 0 and (self._fwd_step % self.attn_probe_every == 0)
+        out = self.gpt2(
+            inputs_embeds=inputs_embeds,
+            attention_mask=full_mask,
+            return_dict=True,
+            output_attentions=request_attn,
+        )
+
+        # Caption→Visual attention attribution. Tracks which fraction of GPT-2's
+        # attention from the caption tokens lands on the [CLS / Action / Patch]
+        # blocks. If patch_attn ≪ cls_attn, GPT-2 is largely ignoring the AGDTR.
+        cls_attn = act_attn = patch_attn = torch.tensor(0.0, device=visual.device)
+        if request_attn and out.attentions is not None:
+            with torch.no_grad():
+                vis_n = visual.shape[1]
+                cls_end = gops
+                act_end = gops + gops * 8
+                # Average attention mass over all layers and heads, restricted
+                # to caption-token rows (everything past VIS_END+BOS).
+                tot_cls = tot_act = tot_pat = torch.tensor(0.0, device=visual.device)
+                for layer_attn in out.attentions:
+                    a = torch.nan_to_num(layer_attn.float(), nan=0.0).mean(dim=1)
+                    cap_rows = a[:, vis_n + 1:, :]      # caption queries only
+                    tot_cls = tot_cls + cap_rows[:, :, :cls_end].sum(dim=-1).mean()
+                    tot_act = tot_act + cap_rows[:, :, cls_end:act_end].sum(dim=-1).mean()
+                    tot_pat = tot_pat + cap_rows[:, :, act_end:vis_n].sum(dim=-1).mean()
+                n_layers = max(float(len(out.attentions)), 1.0)
+                cls_attn = tot_cls / n_layers
+                act_attn = tot_act / n_layers
+                patch_attn = tot_pat / n_layers
+        self._fwd_step += 1
 
         return {
             "logits": out.logits,
@@ -556,6 +623,12 @@ class FocalCapPhase2(nn.Module):
             "budget_mean": budget_mean,
             "budget_std": budget_std,
             "patch_diversity": patch_diversity,
+            "cls_norm_post": cls_norm_post,
+            "act_norm_post": act_norm_post,
+            "patch_norm_post": patch_norm_post,
+            "attn_cls_mass": cls_attn,
+            "attn_act_mass": act_attn,
+            "attn_patch_mass": patch_attn,
         }
 
     @torch.no_grad()

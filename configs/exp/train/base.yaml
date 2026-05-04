@@ -40,6 +40,13 @@ model:
 
   cocap_model:
     use_lora: true
+    # 0.0 = disabled (default). Set to ~0.15 if attribution metrics
+    # (phase2/attn_*_mass) show GPT-2 reading mostly one block, to force
+    # multi-block usage.
+    block_dropout_p: 0.0
+    # Compute caption→visual attention attribution every N train forwards.
+    # 0 disables. 200 ≈ once every ~7s; negligible cost, huge diagnostic value.
+    attn_probe_every: 200
     motion_encoder:
       embed_dim: 384
       num_layers: 4

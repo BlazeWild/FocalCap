@@ -242,7 +242,12 @@ class CoCapLM(pl.LightningModule):
         # Surface a few AGDTR + Action diagnostics on the tqdm bar so a glance
         # tells you whether routing is collapsing, gates are dead, or the action
         # stream is producing garbage. The rest go to TensorBoard / CSV only.
-        bar_keys = {"phase2/gate_mean", "phase2/budget_std", "phase2/patch_diversity"}
+        bar_keys = {
+            "phase2/gate_mean",
+            "phase2/budget_std",
+            "phase2/patch_diversity",
+            "phase2/attn_patch_mass",
+        }
         comp = getattr(self.loss, "latest_loss_components", {})
         if isinstance(comp, dict):
             for k, v in comp.items():

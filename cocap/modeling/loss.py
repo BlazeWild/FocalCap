@@ -47,6 +47,17 @@ class Phase2CaptionLoss(LossBase):
             "phase2/budget_std": output.get("budget_std", zero).detach(),
             "phase2/action_norm": output.get("action_norm", zero).detach(),
             "phase2/patch_diversity": output.get("patch_diversity", zero).detach(),
+            # Per-block visual-token magnitudes after Modality Projector. If
+            # cls_norm ≫ patch_norm, GPT-2 sees mostly CLS.
+            "phase2/cls_norm_post": output.get("cls_norm_post", zero).detach(),
+            "phase2/act_norm_post": output.get("act_norm_post", zero).detach(),
+            "phase2/patch_norm_post": output.get("patch_norm_post", zero).detach(),
+            # Caption→Visual attention mass per block. attn_*_mass should sum to
+            # roughly the caption→visual attention budget; relative ratios show
+            # WHO is being read. Logged only on probe steps; otherwise 0.
+            "phase2/attn_cls_mass": output.get("attn_cls_mass", zero).detach(),
+            "phase2/attn_act_mass": output.get("attn_act_mass", zero).detach(),
+            "phase2/attn_patch_mass": output.get("attn_patch_mass", zero).detach(),
         }
         return loss
 
