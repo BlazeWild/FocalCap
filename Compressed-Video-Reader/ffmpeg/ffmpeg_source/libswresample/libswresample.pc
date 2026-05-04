@@ -1,0 +1,14 @@
+prefix=/teamspace/studios/this_studio/.local/cvreader-ffmpeg
+exec_prefix=${prefix}
+libdir=/teamspace/studios/this_studio/.local/cvreader-ffmpeg/lib
+includedir=/teamspace/studios/this_studio/.local/cvreader-ffmpeg/include
+
+Name: libswresample
+Description: FFmpeg audio resampling library
+Version: 4.7.100
+Requires: libavutil >= 57.28.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lswresample -lm -latomic
+Libs.private: 
+Cflags: -I${includedir}

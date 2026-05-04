@@ -1,0 +1,89 @@
+# @package _global_
+
+hydra:
+  run:
+    dir: ${trainer.default_root_dir}
+  sweep:
+    dir: ${trainer.default_root_dir}
+    subdir: ${hydra.job.override_dirname}
+
+model:
+  use_preextracted_features: false
+  init_motion_ckpt: ""
+  lr_scratch: 1.0e-4
+  lr_lora: 2.0e-4
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.10
+  max_caption_len_train: 50
+  max_new_tokens_eval: 60
+
+  cocap_model:
+    use_lora: true
+    motion_encoder:
+      embed_dim: 384
+      num_layers: 4
+      num_residual_queries: 4
+      use_residual_stream: true
+
+  loss:
+    _target_: cocap.modeling.loss.Phase2CaptionLoss
+    label_smoothing: 0.1
+    ignore_index: -100
+
+trainer:
+  accelerator: "gpu"
+  devices: 1
+  strategy: "auto"
+  max_epochs: 12
+  accumulate_grad_batches: 2
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  num_sanity_val_steps: 0
+  precision: "bf16-mixed"
+
+  logger:
+    _target_: pytorch_lightning.loggers.tensorboard.TensorBoardLogger
+    save_dir: ${trainer.default_root_dir}
+
+  callbacks:
+    - _target_: pytorch_lightning.callbacks.LearningRateMonitor
+      logging_interval: "step"
+    - _target_: pytorch_lightning.callbacks.ModelCheckpoint
+      save_top_k: 1
+      monitor: "val_CIDEr"
+      mode: "max"
+      dirpath: "${trainer.default_root_dir}/checkpoints/best"
+      filename: "best-cider-epoch{epoch:03d}-step{step}"
+      auto_insert_metric_name: false
+      save_last: true
+    - _target_: pytorch_lightning.callbacks.ModelCheckpoint
+      save_top_k: -1
+      monitor: null
+      every_n_epochs: 1
+      dirpath: "${trainer.default_root_dir}/checkpoints/latest"
+      filename: "latest-epoch{epoch:03d}-step{step}"
+      auto_insert_metric_name: false
+      save_on_train_epoch_end: true
+
+train_dataloader:
+  dataset:
+    split: "train"
+  num_workers: 8
+  batch_size: 4
+  prefetch_factor: 2
+  persistent_workers: false
+  shuffle: true
+  pin_memory: true
+  multiprocessing_context: null
+
+val_dataloader:
+  dataset:
+    split: "val"
+  num_workers: 8
+  batch_size: 4
+  prefetch_factor: 2
+  persistent_workers: false
+  shuffle: false
+  pin_memory: true
+  multiprocessing_context: null

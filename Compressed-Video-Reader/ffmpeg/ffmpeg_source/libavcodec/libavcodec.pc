@@ -1,0 +1,14 @@
+prefix=/teamspace/studios/this_studio/.local/cvreader-ffmpeg
+exec_prefix=${prefix}
+libdir=/teamspace/studios/this_studio/.local/cvreader-ffmpeg/lib
+includedir=/teamspace/studios/this_studio/.local/cvreader-ffmpeg/include
+
+Name: libavcodec
+Description: FFmpeg codec library
+Version: 59.37.100
+Requires: libswresample >= 4.7.100, libavutil >= 57.28.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavcodec -pthread -lm -latomic -llzma -lz -lva
+Libs.private: 
+Cflags: -I${includedir}

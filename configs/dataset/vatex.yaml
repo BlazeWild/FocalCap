@@ -1,0 +1,23 @@
+_target_: "cocap.data.datasets.compressed_video.dataset_vatex.VATEXCaptioningDataset"
+
+video_root_mp4: "${hydra:runtime.cwd}/dataset/vatex/videos_h264_240p"
+video_root_pt: "${hydra:runtime.cwd}/dataset/vatex/video_preextracted_pt"
+video_root: "${.video_root_mp4}"
+metadata: "${hydra:runtime.cwd}/dataset/vatex/VATEX_caption.json"
+use_preextracted_features: ${model.use_preextracted_features}
+
+video_reader: "read_frames_compressed_domain"
+max_frames: 8
+video_size:
+  - 224
+  - 224
+max_words: 50
+unfold_sentences: true
+cv_config:
+  num_gop: 8
+  num_mv: 29
+  num_res: 29
+  with_residual: true
+  with_bp_rgb: false
+  use_pre_extract: false
+  sample: "pad"

@@ -1,0 +1,1 @@
+config:c:x86_64:generic:linux:gcc 13 (Ubuntu 13.3.0-6ubuntu2~24.04.1):--prefix=/teamspace/studios/this_studio/.local/cvreader-ffmpeg --bindir=/teamspace/studios/this_studio/.local/bin --enable-pic --disable-doc --disable-debug --disable-ffplay --disable-asm --disable-inline-asm --disable-x86asm

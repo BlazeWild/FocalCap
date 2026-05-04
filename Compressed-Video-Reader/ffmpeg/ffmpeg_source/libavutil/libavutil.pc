@@ -1,0 +1,14 @@
+prefix=/teamspace/studios/this_studio/.local/cvreader-ffmpeg
+exec_prefix=${prefix}
+libdir=/teamspace/studios/this_studio/.local/cvreader-ffmpeg/lib
+includedir=/teamspace/studios/this_studio/.local/cvreader-ffmpeg/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 57.28.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil -pthread -lva-drm -lva -lva-x11 -lva -lvdpau -lX11 -lm -lva -latomic -lX11
+Libs.private: 
+Cflags: -I${includedir}
