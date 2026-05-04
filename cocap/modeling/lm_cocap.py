@@ -75,6 +75,7 @@ class CoCapLM(pl.LightningModule):
 
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         candidates = [
+            os.path.join(project_root, "logs", "vatex_pretrain", "motion_encoder_best.pt"),
             os.path.join(project_root, "logs", "vatex_captioning", "phase1", "checkpoints", "modules", "motion_encoder_best.pt"),
             os.path.join(
                 os.path.dirname(project_root),
@@ -238,11 +239,24 @@ class CoCapLM(pl.LightningModule):
         bsz = batch["input_labels"].size(0)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=bsz, sync_dist=True)
 
+        # Surface a few AGDTR + Action diagnostics on the tqdm bar so a glance
+        # tells you whether routing is collapsing, gates are dead, or the action
+        # stream is producing garbage. The rest go to TensorBoard / CSV only.
+        bar_keys = {"phase2/gate_mean", "phase2/budget_std", "phase2/patch_diversity"}
         comp = getattr(self.loss, "latest_loss_components", {})
         if isinstance(comp, dict):
             for k, v in comp.items():
                 if torch.is_tensor(v):
-                    self.log(k, v, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=bsz, sync_dist=True)
+                    self.log(
+                        k,
+                        v,
+                        on_step=True,
+                        on_epoch=True,
+                        prog_bar=(k in bar_keys),
+                        logger=True,
+                        batch_size=bsz,
+                        sync_dist=True,
+                    )
 
         return loss
 
@@ -276,6 +290,14 @@ class CoCapLM(pl.LightningModule):
             length_penalty=1.0,
         )
         gen_texts = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+
+        # Generation health: did beams actually emit EOS, or did they all hit the
+        # max_new_tokens cap? And how long are the captions on average?
+        eos_id = int(self.tokenizer.eos_token_id)
+        eos_hits = (gen_ids == eos_id).any(dim=1).float().mean()
+        gen_lengths = (gen_ids != eos_id).sum(dim=1).float().mean()
+        self.log("gen_eos_rate", eos_hits, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=bsz, sync_dist=True)
+        self.log("gen_mean_len", gen_lengths, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=bsz, sync_dist=True)
 
         if self.batch_res is None:
             self.batch_res = {

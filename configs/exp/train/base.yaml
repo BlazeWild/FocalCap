@@ -6,6 +6,26 @@ hydra:
   sweep:
     dir: ${trainer.default_root_dir}
     subdir: ${hydra.job.override_dirname}
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: "[%(asctime)s][%(name)s][%(levelname)s] - %(message)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: ${hydra:runtime.output_dir}/train_net.log
+        mode: a
+        encoding: utf-8
+    root:
+      level: INFO
+      handlers: [console, file]
+    disable_existing_loggers: false
 
 model:
   use_preextracted_features: false
@@ -35,7 +55,7 @@ trainer:
   accelerator: "gpu"
   devices: 1
   strategy: "auto"
-  max_epochs: 12
+  max_epochs: 20
   accumulate_grad_batches: 2
   gradient_clip_val: 1.0
   log_every_n_steps: 10
@@ -43,8 +63,12 @@ trainer:
   precision: "bf16-mixed"
 
   logger:
-    _target_: pytorch_lightning.loggers.tensorboard.TensorBoardLogger
-    save_dir: ${trainer.default_root_dir}
+    - _target_: pytorch_lightning.loggers.tensorboard.TensorBoardLogger
+      save_dir: ${trainer.default_root_dir}
+      name: "tensorboard"
+    - _target_: pytorch_lightning.loggers.csv_logs.CSVLogger
+      save_dir: ${trainer.default_root_dir}
+      name: "csv_logs"
 
   callbacks:
     - _target_: pytorch_lightning.callbacks.LearningRateMonitor
@@ -72,7 +96,7 @@ train_dataloader:
   num_workers: 8
   batch_size: 4
   prefetch_factor: 2
-  persistent_workers: false
+  persistent_workers: true
   shuffle: true
   pin_memory: true
   multiprocessing_context: null
@@ -80,10 +104,10 @@ train_dataloader:
 val_dataloader:
   dataset:
     split: "val"
-  num_workers: 8
+  num_workers: 4
   batch_size: 4
   prefetch_factor: 2
-  persistent_workers: false
+  persistent_workers: true
   shuffle: false
   pin_memory: true
   multiprocessing_context: null

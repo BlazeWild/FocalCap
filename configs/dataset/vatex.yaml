@@ -13,6 +13,11 @@ video_size:
   - 224
 max_words: 50
 unfold_sentences: true
+# K = how many random caption draws per video per train epoch.
+# 1   = current behaviour (one random caption per video per epoch).
+# 10  = match VATEX's full caption set (10 per video) with 10× train cost.
+# Forced to 1 on val/test inside the dataset regardless of this setting.
+captions_per_video: 1
 cv_config:
   num_gop: 8
   num_mv: 29

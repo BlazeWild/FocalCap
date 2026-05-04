@@ -41,3 +41,26 @@ source ~/venvs/distilled-motion-mae/bin/activate
 python3 tools/train_net.py "ckpt_path=/home/ashim/runs/vatex_pretrain_full_phase1_cls_res/checkpoints/latest/latest-epoch001-step4288.ckpt" "trainer.default_root_dir=/home/ashim/runs/vatex_pretrain_full_phase1_cls_res"
 
 python3 tools/train_net.py "trainer.default_root_dir=/home/ashim/runs/vatex_pretrain_full_phase1_cls_res"
+
+
+
+# PHASE 2
+source ~/venvs/distilled-motion-mae/bin/activate
+cd /mnt/c/hav_video_captioning/FocalCap
+python tools/train_net.py +exp/train=vatex_captioning
+If you want to override the motion ckpt path explicitly (recommended, in case auto-resolve picks the wrong one):
+
+
+python tools/train_net.py +exp/train=vatex_captioning \
+  model.init_motion_ckpt=/mnt/c/hav_video_captioning/FocalCap/logs/vatex_pretrain/motion_encoder_best.pt
+To resume from a Phase-2 latest checkpoint later:
+
+
+python tools/train_net.py +exp/train=vatex_captioning \
+  ckpt_path=/mnt/c/hav_video_captioning/FocalCap/logs/vatex_captioning/phase2_oneshot/checkpoints/latest/last.ckpt
+Outputs will land at logs/vatex_captioning/phase2_oneshot/:
+
+checkpoints/best/best-cider-epoch{NNN}-step{S}.ckpt (best by val_CIDEr)
+checkpoints/latest/latest-epoch{NNN}-step{S}.ckpt (every epoch)
+checkpoints/modules/motion_encoder_best.pt, router_best.pt (best-CIDEr Phase-2 module dumps)
+checkpoints/modules/phase2/motion_encoder-epoch{NNN}-step{S}.pt, router-epoch{NNN}-step{S}.pt (per-epoch Phase-2 module dumps)

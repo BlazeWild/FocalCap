@@ -122,8 +122,8 @@ class BudgetAllocator(nn.Module):
     ) -> torch.Tensor:
         bsz, gops, _ = cls_tokens.shape
         x = torch.cat([
-            cls_tokens.view(bsz * gops, 1, 768),
-            action_tokens.view(bsz * gops, 8, 768),
+            cls_tokens.reshape(bsz * gops, 1, 768),
+            action_tokens.reshape(bsz * gops, 8, 768),
             self.budget_token.expand(bsz * gops, -1, -1),
         ], dim=1)
 
@@ -198,11 +198,11 @@ class PatchRouter(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         bsz, gops, npatch, _ = clip_patches.shape
 
-        q = torch.cat([cls_tokens.unsqueeze(2), action_tokens], dim=2).view(bsz * gops, 9, 768)
-        kv = clip_patches.view(bsz * gops, npatch, 768)
+        q = torch.cat([cls_tokens.unsqueeze(2), action_tokens], dim=2).reshape(bsz * gops, 9, 768)
+        kv = clip_patches.reshape(bsz * gops, npatch, 768)
 
         _, attn_w = self.scorer(q, kv, need_weights=True)
-        raw = attn_w.mean(dim=1).mean(dim=1).view(bsz, gops, npatch)
+        raw = attn_w.mean(dim=1).mean(dim=1).reshape(bsz, gops, npatch)
 
         penalty_mask = torch.zeros((bsz, npatch), device=raw.device, dtype=raw.dtype)
         weighted_chunks: List[torch.Tensor] = []
@@ -340,6 +340,7 @@ class FocalCapPhase2(nn.Module):
                 lora_dropout=0.1,
                 bias="none",
                 task_type="CAUSAL_LM",
+                fan_in_fan_out=True,
             )
             base_gpt2 = get_peft_model(base_gpt2, lora_cfg)
             self.using_lora = True
@@ -423,7 +424,7 @@ class FocalCapPhase2(nn.Module):
         bsz, gops, _ = clip_i_cls.shape
 
         cls_proj = self.modality_projector(clip_i_cls)
-        act_proj = self.modality_projector(action_tokens.view(bsz, gops * 8, 768)).view(bsz, gops, 8, 768)
+        act_proj = self.modality_projector(action_tokens.reshape(bsz, gops * 8, 768)).reshape(bsz, gops, 8, 768)
         patch_proj = self.modality_projector(weighted_patches)
 
         t_embed = self.temporal_embed[:, :gops, :]
@@ -492,12 +493,27 @@ class FocalCapPhase2(nn.Module):
             clip_i_cls,
         )
 
-        bg_patches = clip_i_spatial.view(bsz * gops, 196, 768)
+        bg_patches = clip_i_spatial.reshape(bsz * gops, 196, 768)
         action_bg = self.action_encoder(motion_tokens, residual_tokens, bg_patches)
         action = action_bg.view(bsz, gops, 8, 768)
 
         budgets = self.budget_allocator(clip_i_cls, action, valid_gop_mask)
         routed = self.patch_router(clip_i_cls, action, clip_i_spatial, budgets)
+
+        # Diagnostics: per-batch health signals for the AGDTR + Action stack.
+        with torch.no_grad():
+            action_norm = action.float().norm(dim=-1).mean()
+            budgets_f = budgets.float()
+            valid_gops = valid_gop_mask.float().sum(dim=1).clamp_min(1.0)
+            budget_mean = (budgets_f.sum(dim=1) / valid_gops).mean()
+            budget_std = budgets_f.std(dim=1, unbiased=False).mean()
+            patch_indices_t = routed["patch_indices"]
+            patch_unique = (patch_indices_t.float().std(dim=1) > 0).float().mean()
+            patch_diversity = torch.tensor(0.0, device=action.device)
+            for b in range(bsz):
+                idx_b = patch_indices_t[b]
+                patch_diversity = patch_diversity + (idx_b.unique().numel() / max(int(idx_b.numel()), 1))
+            patch_diversity = patch_diversity / max(bsz, 1)
 
         visual = self._build_visual_payload(
             clip_i_cls=clip_i_cls,
@@ -536,6 +552,10 @@ class FocalCapPhase2(nn.Module):
             "labels": full_labels,
             "gop_budgets": budgets,
             "gate_mean": routed["gate_mean"],
+            "action_norm": action_norm,
+            "budget_mean": budget_mean,
+            "budget_std": budget_std,
+            "patch_diversity": patch_diversity,
         }
 
     @torch.no_grad()
@@ -619,4 +639,5 @@ class FocalCapPhase2(nn.Module):
             length_penalty=length_penalty,
             early_stopping=True,
             pad_token_id=self.gpt2.config.eos_token_id,
+            eos_token_id=self.gpt2.config.eos_token_id,
         )

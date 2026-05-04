@@ -27,18 +27,26 @@ class Phase2CaptionLoss(LossBase):
         logits = output["logits"].float()            # [B, L, V]
         labels = output["labels"].long()             # [B, L]
 
+        # Causal LM shift: logits[:, t] predicts the token at position t+1.
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+
         loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
             ignore_index=self.ignore_index,
             label_smoothing=self.label_smoothing,
             reduction="mean",
         )
 
+        zero = torch.tensor(0.0, device=loss.device)
         self.latest_loss_components = {
             "phase2/ce_loss": loss.detach(),
-            "phase2/gate_mean": output.get("gate_mean", torch.tensor(0.0, device=loss.device)).detach(),
-            "phase2/budget_mean": output.get("gop_budgets", torch.zeros((1, 1), device=loss.device)).float().mean().detach(),
+            "phase2/gate_mean": output.get("gate_mean", zero).detach(),
+            "phase2/budget_mean": output.get("budget_mean", zero).detach(),
+            "phase2/budget_std": output.get("budget_std", zero).detach(),
+            "phase2/action_norm": output.get("action_norm", zero).detach(),
+            "phase2/patch_diversity": output.get("patch_diversity", zero).detach(),
         }
         return loss
 

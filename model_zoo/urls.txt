@@ -39,18 +39,7 @@ https://openaipublic.azureedge.net/clip/models/5806e77cd80f8b59890b7e101eabd078d
 #
 # Recommended: load via `transformers.SiglipModel.from_pretrained(...)`; aria2
 # can pull the safetensors directly:
-https://huggingface.co/google/siglip-base-patch16-224/resolve/main/model.safetensors
-    dir=siglip_model
-    out=siglip-base-patch16-224.safetensors
-    auto-file-renaming=false
-https://huggingface.co/google/siglip-base-patch16-224/resolve/main/config.json
-    dir=siglip_model
-    out=config.json
-    auto-file-renaming=false
-https://huggingface.co/google/siglip-base-patch16-224/resolve/main/preprocessor_config.json
-    dir=siglip_model
-    out=preprocessor_config.json
-    auto-file-renaming=false
+
 
 # Larger SigLIP variants (commented out — only enable if you also widen the
 # student to embed_dim 512+, otherwise teacher capacity is wasted):
@@ -63,3 +52,32 @@ https://huggingface.co/google/siglip-base-patch16-224/resolve/main/preprocessor_
 #     out=siglip2-base-patch16-224.safetensors
 #     auto-file-renaming=false
 
+# === GPT-2 (Base 124M Model) ===
+https://huggingface.co/openai-community/gpt2/resolve/main/config.json?download=true
+    dir=gpt2_model
+    out=config.json
+    auto-file-renaming=false
+https://huggingface.co/openai-community/gpt2/resolve/main/generation_config.json?download=true
+    dir=gpt2_model
+    out=generation_config.json
+    auto-file-renaming=false
+https://huggingface.co/openai-community/gpt2/resolve/main/vocab.json?download=true
+    dir=gpt2_model
+    out=vocab.json
+    auto-file-renaming=false
+https://huggingface.co/openai-community/gpt2/resolve/main/merges.txt?download=true
+    dir=gpt2_model
+    out=merges.txt
+    auto-file-renaming=false
+https://huggingface.co/openai-community/gpt2/resolve/main/tokenizer.json?download=true
+    dir=gpt2_model
+    out=tokenizer.json
+    auto-file-renaming=false
+https://huggingface.co/openai-community/gpt2/resolve/main/tokenizer_config.json?download=true
+    dir=gpt2_model
+    out=tokenizer_config.json
+    auto-file-renaming=false
+https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors?download=true
+    dir=gpt2_model
+    out=model.safetensors
+    auto-file-renaming=false

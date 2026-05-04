@@ -48,6 +48,7 @@ class VATEXCaptioningDataset(data.Dataset):
             video_root_pt: Optional[str] = None,
             max_gops_per_video: int = 8,
             max_videos_per_split: int = -1,
+            captions_per_video: int = 1,
     ):
         self.split = split
         self.video_root = video_root
@@ -65,6 +66,16 @@ class VATEXCaptioningDataset(data.Dataset):
             self.h265_cfg = CVConfig(**dict(cv_config))
         self.max_gops_per_video = int(max_gops_per_video)
         self.max_videos_per_split = int(max_videos_per_split)
+        # Train-time only: how many random caption picks to draw per video per
+        # epoch. With K=1 we visit each video once and pick one random caption
+        # (current behaviour). With K>1 the index space expands K-fold and the
+        # video is decoded K times per epoch with K independent random caption
+        # draws each time. Validation/test always use K=1 (one prediction per
+        # video) — eval matches predictions to the full GT caption set, so
+        # over-sampling on val would only inflate cost without improving CIDEr.
+        self.captions_per_video = max(1, int(captions_per_video))
+        if split != "train":
+            self.captions_per_video = 1
         # For flattened GOP indexing we need all valid GOPs from a video when decoding mp4.
         self.h265_cfg_all = replace(self.h265_cfg, num_gop=-1)
 
@@ -184,7 +195,7 @@ class VATEXCaptioningDataset(data.Dataset):
 
 
     def __len__(self):
-        return len(self.video_ids)
+        return len(self.video_ids) * self.captions_per_video
 
     def _count_valid_gops(self, video_id: str) -> int:
         """Count valid GOP chunks for one video.
@@ -471,7 +482,10 @@ class VATEXCaptioningDataset(data.Dataset):
         # Skip those samples instead of crashing dataloader workers.
         max_attempts = 32
         last_exc = None
-        cur_idx = int(idx)
+        # When captions_per_video>1, the index space is num_videos * K; collapse
+        # it back to a video index. With K=1 this reduces to the previous mod 1.
+        n_videos = len(self.video_ids)
+        cur_idx = int(idx) % max(n_videos, 1)
 
         for _attempt in range(max_attempts):
             video_id = self.video_ids[cur_idx]
@@ -488,7 +502,11 @@ class VATEXCaptioningDataset(data.Dataset):
             input_ids = encoded_dict["input_ids"].squeeze(0)
             input_mask = encoded_dict["attention_mask"].squeeze(0)
             input_labels = input_ids.clone()
-            input_labels[input_ids == self.tokenizer.pad_token_id] = -100
+            # GPT-2 has pad_token == eos_token, so masking by token id would also
+            # erase the real trailing EOS the model needs to learn to emit.
+            # Use the attention_mask to mask ONLY true padding positions and keep
+            # the final EOS as a supervised target.
+            input_labels[input_mask == 0] = -100
 
             if (not self.use_pt_features) and (getattr(video_readers_mod, "cv_reader", None) is None):
                 raise RuntimeError(
