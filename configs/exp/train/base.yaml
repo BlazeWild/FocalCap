@@ -40,10 +40,11 @@ model:
 
   cocap_model:
     use_lora: true
-    # 0.0 = disabled (default). Set to ~0.15 if attribution metrics
-    # (phase2/attn_*_mass) show GPT-2 reading mostly one block, to force
-    # multi-block usage.
-    block_dropout_p: 0.0
+    # 0.0 = disabled. Forces multi-block usage by zeroing one block at random
+    # during training. Confirmed via tools/probe_attribution.py at epoch 5 that
+    # GPT-2 was reading 88% of visual attention from CLS — so this is on at
+    # 0.20 to push it toward Action+Patch.
+    block_dropout_p: 0.20
     # Compute caption→visual attention attribution every N train forwards.
     # 0 disables. 200 ≈ once every ~7s; negligible cost, huge diagnostic value.
     attn_probe_every: 200

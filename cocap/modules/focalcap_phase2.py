@@ -333,12 +333,24 @@ class FocalCapPhase2(nn.Module):
         self.patch_router = PatchRouter()
         self.modality_projector = ModalityProjector()
 
+        # Per-block magnitude equalizers, applied AFTER the modality projector
+        # so each stream enters GPT-2 with O(1) std. Action Encoder output was
+        # ~6x louder than CLS pre-norm; GPT-2 attention then dampened it,
+        # causing CLS to absorb most attention mass.
+        self.cls_block_ln = nn.LayerNorm(768)
+        self.act_block_ln = nn.LayerNorm(768)
+        self.patch_block_ln = nn.LayerNorm(768)
+
         self.temporal_embed = nn.Parameter(torch.randn(1, 8, 768) * 0.02)
         self.type_embed = nn.Parameter(torch.randn(1, 3, 768) * 0.02)
         self.patch_spatial_embed = nn.Parameter(torch.randn(1, 196, 768) * 0.02)
         self.vis_end = nn.Parameter(torch.randn(1, 1, 768) * 0.02)
 
-        base_gpt2 = GPT2LMHeadModel.from_pretrained(gpt2_model_path)
+        # `attn_implementation="eager"` is required so output_attentions=True
+        # actually populates per-layer attention weights. SDPA / FlashAttention
+        # silently drop them. Forward speed is ~5% slower with eager but the
+        # diagnostic is worth it; flip back to "sdpa" if you don't need probes.
+        base_gpt2 = GPT2LMHeadModel.from_pretrained(gpt2_model_path, attn_implementation="eager")
         if getattr(base_gpt2.config, "loss_type", None) is None:
             base_gpt2.config.loss_type = "ForCausalLMLoss"
 
@@ -437,6 +449,14 @@ class FocalCapPhase2(nn.Module):
         cls_proj = self.modality_projector(clip_i_cls)
         act_proj = self.modality_projector(action_tokens.reshape(bsz, gops * 8, 768)).reshape(bsz, gops, 8, 768)
         patch_proj = self.modality_projector(weighted_patches)
+
+        # Per-block LayerNorm so all three visual streams reach GPT-2 with
+        # comparable magnitudes. Without this, the Action Encoder's output
+        # (norm ~89) dwarfs CLS (~14) and patches (~11); GPT-2 then dampens
+        # the loud rows and reads almost everything from CLS.
+        cls_proj = self.cls_block_ln(cls_proj)
+        act_proj = self.act_block_ln(act_proj)
+        patch_proj = self.patch_block_ln(patch_proj)
 
         t_embed = self.temporal_embed[:, :gops, :]
 
