@@ -49,14 +49,20 @@ model:
     #   CLS-only (baseline) → CLS+Action → Full
     use_action_tokens: true
     use_spatial_tokens: true
-    # 0.0 = disabled. Forces multi-block usage by zeroing one block at random
-    # during training. Confirmed via tools/probe_attribution.py at epoch 5 that
-    # GPT-2 was reading 88% of visual attention from CLS — so this is on at
-    # 0.20 to push it toward Action+Patch.
-    block_dropout_p: 0.20
-    # Compute caption→visual attention attribution every N train forwards.
-    # 0 disables. 200 ≈ once every ~7s; negligible cost, huge diagnostic value.
+    # Legacy one-block-dropout probability. Kept at 0 because we now use the
+    # per-block schedule below to bias CLS suppression.
+    block_dropout_p: 0.00
+    # Per-block dropout schedule (applied independently each train step):
+    # stronger CLS suppression so GPT-2 cannot overfit the shortcut.
+    block_dropout_cls_p: 0.22
+    block_dropout_action_p: 0.05
+    block_dropout_patch_p: 0.05
+    # Attribution probe cadence (for logging diagnostics).
     attn_probe_every: 200
+    # Attention-aux cadence (for optimization signal), target share, and weight.
+    attn_aux_every: 25
+    attn_aux_target_share: 0.20
+    attn_aux_weight: 3.0
     motion_encoder:
       embed_dim: 384
       num_layers: 4

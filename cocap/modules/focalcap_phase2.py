@@ -302,7 +302,13 @@ class FocalCapPhase2(nn.Module):
         full_gpt2_finetune: bool = False,
         train_lora_during_full_finetune: bool = False,
         block_dropout_p: float = 0.0,
+        block_dropout_cls_p: float = 0.0,
+        block_dropout_action_p: float = 0.0,
+        block_dropout_patch_p: float = 0.0,
         attn_probe_every: int = 200,
+        attn_aux_every: int = 0,
+        attn_aux_target_share: float = 0.15,
+        attn_aux_weight: float = 2.0,
         use_action_tokens: bool = True,
         use_spatial_tokens: bool = True,
     ):
@@ -322,9 +328,15 @@ class FocalCapPhase2(nn.Module):
         # Set to e.g. 0.15 if attribution metrics show GPT-2 is reading mostly
         # one block; this forces it to use all three.
         self.block_dropout_p = float(block_dropout_p)
+        self.block_dropout_cls_p = float(block_dropout_cls_p)
+        self.block_dropout_action_p = float(block_dropout_action_p)
+        self.block_dropout_patch_p = float(block_dropout_patch_p)
         # Compute caption→visual attention attribution every N forward passes.
         # 0 disables. 200 is roughly once every ~7s on this hardware, negligible.
         self.attn_probe_every = int(attn_probe_every)
+        self.attn_aux_every = int(attn_aux_every)
+        self.attn_aux_target_share = float(attn_aux_target_share)
+        self.attn_aux_weight = float(attn_aux_weight)
         self._fwd_step = 0
         self.agdtr_tokens = bool(agdtr_tokens)
         
@@ -619,24 +631,57 @@ class FocalCapPhase2(nn.Module):
         # off (p=0); flip via base.yaml if attribution metrics show dominance.
         # Only applies to the blocks that are actually present in the visual payload.
         n_active_blocks = 1 + int(self.use_action_tokens) + int(self.use_spatial_tokens and self.use_action_tokens)
-        if self.training and self.block_dropout_p > 0.0 and n_active_blocks >= 2:
-            r = torch.rand(1, device=visual.device).item()
-            if r < self.block_dropout_p:
-                which = int(torch.randint(0, n_active_blocks, (1,)).item())
-                if n_active_blocks == 3:
-                    # Full model: cls / action / patch
-                    if which == 0:
-                        visual = torch.cat([torch.zeros_like(cls_block), act_block, patch_block], dim=1)
-                    elif which == 1:
-                        visual = torch.cat([cls_block, torch.zeros_like(act_block), patch_block], dim=1)
-                    else:
-                        visual = torch.cat([cls_block, act_block, torch.zeros_like(patch_block)], dim=1)
-                elif n_active_blocks == 2:
-                    # CLS + Action only
-                    if which == 0:
-                        visual = torch.cat([torch.zeros_like(cls_block), act_block], dim=1)
-                    else:
-                        visual = torch.cat([cls_block, torch.zeros_like(act_block)], dim=1)
+        if self.training and n_active_blocks >= 2:
+            use_custom_block_dropout = (
+                self.block_dropout_cls_p > 0.0
+                or self.block_dropout_action_p > 0.0
+                or self.block_dropout_patch_p > 0.0
+            )
+            if use_custom_block_dropout:
+                has_act = act_block.shape[1] > 0
+                has_patch = patch_block.shape[1] > 0
+
+                drop_cls = bool(torch.rand(1, device=visual.device).item() < self.block_dropout_cls_p)
+                drop_act = has_act and bool(torch.rand(1, device=visual.device).item() < self.block_dropout_action_p)
+                drop_patch = has_patch and bool(torch.rand(1, device=visual.device).item() < self.block_dropout_patch_p)
+
+                if has_patch and drop_cls and drop_act and drop_patch:
+                    keep = int(torch.randint(0, 3, (1,), device=visual.device).item())
+                    drop_cls = keep != 0
+                    drop_act = keep != 1
+                    drop_patch = keep != 2
+                elif (not has_patch) and drop_cls and drop_act:
+                    keep = int(torch.randint(0, 2, (1,), device=visual.device).item())
+                    drop_cls = keep != 0
+                    drop_act = keep != 1
+
+                cls_out = torch.zeros_like(cls_block) if drop_cls else cls_block
+                parts = [cls_out]
+                if has_act:
+                    act_out = torch.zeros_like(act_block) if drop_act else act_block
+                    parts.append(act_out)
+                if has_patch:
+                    patch_out = torch.zeros_like(patch_block) if drop_patch else patch_block
+                    parts.append(patch_out)
+                visual = torch.cat(parts, dim=1)
+            elif self.block_dropout_p > 0.0:
+                r = torch.rand(1, device=visual.device).item()
+                if r < self.block_dropout_p:
+                    which = int(torch.randint(0, n_active_blocks, (1,), device=visual.device).item())
+                    if n_active_blocks == 3:
+                        # Full model: cls / action / patch
+                        if which == 0:
+                            visual = torch.cat([torch.zeros_like(cls_block), act_block, patch_block], dim=1)
+                        elif which == 1:
+                            visual = torch.cat([cls_block, torch.zeros_like(act_block), patch_block], dim=1)
+                        else:
+                            visual = torch.cat([cls_block, act_block, torch.zeros_like(patch_block)], dim=1)
+                    elif n_active_blocks == 2:
+                        # CLS + Action only
+                        if which == 0:
+                            visual = torch.cat([torch.zeros_like(cls_block), act_block], dim=1)
+                        else:
+                            visual = torch.cat([cls_block, torch.zeros_like(act_block)], dim=1)
 
         vis_end = self.vis_end.expand(bsz, -1, -1)
 
@@ -660,7 +705,9 @@ class FocalCapPhase2(nn.Module):
         ], dim=1)
         full_labels = torch.cat([ignore_prefix, text_labels], dim=1)
 
-        request_attn = self.training and self.attn_probe_every > 0 and (self._fwd_step % self.attn_probe_every == 0)
+        probe_step = self.training and self.attn_probe_every > 0 and (self._fwd_step % self.attn_probe_every == 0)
+        aux_step = self.training and self.attn_aux_every > 0 and (self._fwd_step % self.attn_aux_every == 0)
+        request_attn = probe_step or aux_step
         out = self.gpt2(
             inputs_embeds=inputs_embeds,
             attention_mask=full_mask,
@@ -694,11 +741,11 @@ class FocalCapPhase2(nn.Module):
             # Auxiliary hinge loss: penalize when patch attention share drops
             # below target_share. This gives explicit gradient signal for GPT-2
             # to attend to patch tokens instead of collapsing everything to CLS.
-            attn_total = (cls_attn + act_attn + patch_attn).detach().clamp_min(1e-6)
-            # patch_share tracks gradient through patch_attn only
-            patch_share = patch_attn / attn_total
-            target_share = 0.15
-            attn_aux_loss = F.relu(target_share - patch_share) * 2.0
+            if aux_step:
+                attn_total = (cls_attn + act_attn + patch_attn).detach().clamp_min(1e-6)
+                # patch_share tracks gradient through patch_attn only
+                patch_share = patch_attn / attn_total
+                attn_aux_loss = F.relu(self.attn_aux_target_share - patch_share) * self.attn_aux_weight
 
         self._fwd_step += 1
 
