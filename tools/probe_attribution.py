@@ -42,10 +42,7 @@ def main():
     clip_path = str(base / "model_zoo" / "clip_model" / "ViT-B-16.pt")
     motion_ckpt = str(base / "logs" / "vatex_pretrain" / "motion_encoder_best.pt")
 
-    candidates = sorted((base / "logs/vatex_captioning/phase2_oneshot/checkpoints/latest").glob("latest-epoch*.ckpt"))
-    if not candidates:
-        raise SystemExit("no checkpoint found")
-    ckpt = str(candidates[-1])
+    ckpt = str(base / "logs" / "vatex_captioning" / "phase2_oneshot" / "checkpoints" / "latest" / "latest-epoch008-step62037.ckpt")
     print(f"using ckpt: {ckpt}")
 
     me = MotionTransformer(embed_dim=384, num_layers=4, num_residual_queries=4, use_residual_stream=True)

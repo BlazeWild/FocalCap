@@ -31,7 +31,7 @@ class Phase2CaptionLoss(LossBase):
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
 
-        loss = F.cross_entropy(
+        ce_loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=self.ignore_index,
@@ -39,9 +39,15 @@ class Phase2CaptionLoss(LossBase):
             reduction="mean",
         )
 
-        zero = torch.tensor(0.0, device=loss.device)
+        zero = torch.tensor(0.0, device=ce_loss.device)
+        # Auxiliary attention loss — forces GPT-2 to read patch tokens.
+        # Only non-zero on probe steps (attn_probe_every); negligible cost.
+        attn_aux = output.get("attn_aux_loss", zero)
+        loss = ce_loss + attn_aux
+
         self.latest_loss_components = {
-            "phase2/ce_loss": loss.detach(),
+            "phase2/ce_loss": ce_loss.detach(),
+            "phase2/attn_aux_loss": attn_aux.detach(),
             "phase2/gate_mean": output.get("gate_mean", zero).detach(),
             "phase2/budget_mean": output.get("budget_mean", zero).detach(),
             "phase2/budget_std": output.get("budget_std", zero).detach(),

@@ -40,6 +40,15 @@ model:
 
   cocap_model:
     use_lora: true
+    agdtr_tokens: true
+    # ── Block-level ablation flags ──
+    # use_action_tokens: false → CLS-only (motion/action/residual skipped entirely)
+    # use_spatial_tokens: false → CLS + Action only (AGDTR budget/router skipped)
+    # Both true = full model (CLS + Action + Spatial patches via AGDTR).
+    # Run 2 epochs each to compare CIDEr:
+    #   CLS-only (baseline) → CLS+Action → Full
+    use_action_tokens: true
+    use_spatial_tokens: true
     # 0.0 = disabled. Forces multi-block usage by zeroing one block at random
     # during training. Confirmed via tools/probe_attribution.py at epoch 5 that
     # GPT-2 was reading 88% of visual attention from CLS — so this is on at

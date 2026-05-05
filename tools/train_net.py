@@ -25,9 +25,22 @@ def train(
     val_dataloader: DataLoader,
     trainer: pl.Trainer,
     ckpt_path: str = None,
+    weights_only_ckpt: str = "",
 ):
     if ckpt_path is None:
         ckpt_path = os.environ.get("CKPT_PATH")
+
+    if weights_only_ckpt:
+        raw = torch.load(weights_only_ckpt, map_location="cpu", weights_only=False)
+        state = raw.get("state_dict", raw)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        logger.info(
+            "Loaded weights_only_ckpt=%s (missing=%d unexpected=%d)",
+            weights_only_ckpt,
+            len(missing),
+            len(unexpected),
+        )
+        ckpt_path = None
 
     try:
         from torchinfo import summary

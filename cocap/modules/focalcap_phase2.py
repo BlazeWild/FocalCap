@@ -227,7 +227,11 @@ class PatchRouter(nn.Module):
                 index=top_idx.unsqueeze(-1).expand(-1, -1, 768),
             )
             raw_t = torch.gather(raw[:, t, :], dim=1, index=top_idx)
-            gates_t = torch.sigmoid(raw_t)
+            # Softmax-normalize scores across selected patches (instead of sigmoid).
+            # sigmoid(raw≈0)=0.5 was crushing patch magnitudes to half of CLS/Action,
+            # causing GPT-2 to ignore them.  Softmax keeps relative ranking while
+            # rescaling so mean gate ≈ 1.0 (no net attenuation).
+            gates_t = F.softmax(raw_t, dim=-1) * raw_t.shape[-1]
             weighted_t = patches_t * gates_t.unsqueeze(-1)
 
             weighted_chunks.append(weighted_t)
@@ -294,10 +298,25 @@ class FocalCapPhase2(nn.Module):
         motion_encoder: nn.Module,
         clip_state_dict: Optional[Any] = None,
         use_lora: bool = True,
+        agdtr_tokens: bool = True,
+        full_gpt2_finetune: bool = False,
+        train_lora_during_full_finetune: bool = False,
         block_dropout_p: float = 0.0,
         attn_probe_every: int = 200,
+        use_action_tokens: bool = True,
+        use_spatial_tokens: bool = True,
     ):
         super().__init__()
+
+        # ── Block-level ablation flags ──
+        # use_action_tokens=false → skip ActionEncoder; visual = CLS only.
+        # use_spatial_tokens=false → skip BudgetAllocator + PatchRouter; visual = CLS + Action.
+        # Both true = full model (CLS + Action + Spatial patches via AGDTR).
+        self.use_action_tokens = bool(use_action_tokens)
+        self.use_spatial_tokens = bool(use_spatial_tokens)
+        if self.use_spatial_tokens and not self.use_action_tokens:
+            # Spatial routing needs action tokens for budget/scorer queries
+            raise ValueError("use_spatial_tokens requires use_action_tokens=true")
 
         # Probabilistic block dropout (CLS / Action / Patch). 0.0 = disabled.
         # Set to e.g. 0.15 if attribution metrics show GPT-2 is reading mostly
@@ -307,7 +326,8 @@ class FocalCapPhase2(nn.Module):
         # 0 disables. 200 is roughly once every ~7s on this hardware, negligible.
         self.attn_probe_every = int(attn_probe_every)
         self._fwd_step = 0
-
+        self.agdtr_tokens = bool(agdtr_tokens)
+        
         self.motion_encoder = motion_encoder
         # Phase-2 must discard Phase-1 teacher heads.
         if hasattr(self.motion_encoder, "decoder"):
@@ -341,6 +361,15 @@ class FocalCapPhase2(nn.Module):
         self.act_block_ln = nn.LayerNorm(768)
         self.patch_block_ln = nn.LayerNorm(768)
 
+        # Freeze modules that won't be used (saves memory + ensures no stale gradients)
+        if not self.use_action_tokens:
+            self._freeze_module(self.action_encoder)
+            self._freeze_module(self.budget_allocator)
+            self._freeze_module(self.patch_router)
+        elif not self.use_spatial_tokens:
+            self._freeze_module(self.budget_allocator)
+            self._freeze_module(self.patch_router)
+
         self.temporal_embed = nn.Parameter(torch.randn(1, 8, 768) * 0.02)
         self.type_embed = nn.Parameter(torch.randn(1, 3, 768) * 0.02)
         self.patch_spatial_embed = nn.Parameter(torch.randn(1, 196, 768) * 0.02)
@@ -370,7 +399,15 @@ class FocalCapPhase2(nn.Module):
 
         self.gpt2 = base_gpt2
         self._freeze_module(self.gpt2)
-        if self.using_lora:
+        if full_gpt2_finetune:
+            # Keep PEFT wrapper/checkpoint compatibility, but allow full GPT-2
+            # optimization. LoRA adapters can optionally stay frozen.
+            for n, p in self.gpt2.named_parameters():
+                if "lora_" in n:
+                    p.requires_grad = bool(train_lora_during_full_finetune)
+                else:
+                    p.requires_grad = True
+        elif self.using_lora:
             for n, p in self.gpt2.named_parameters():
                 if "lora_" in n:
                     p.requires_grad = True
@@ -439,32 +476,33 @@ class FocalCapPhase2(nn.Module):
     def _build_visual_payload(
         self,
         clip_i_cls: torch.Tensor,
-        action_tokens: torch.Tensor,
-        weighted_patches: torch.Tensor,
-        patch_indices: torch.Tensor,
-        patch_gop_ids: torch.Tensor,
+        action_tokens: Optional[torch.Tensor] = None,
+        weighted_patches: Optional[torch.Tensor] = None,
+        patch_indices: Optional[torch.Tensor] = None,
+        patch_gop_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz, gops, _ = clip_i_cls.shape
 
         cls_proj = self.modality_projector(clip_i_cls)
-        act_proj = self.modality_projector(action_tokens.reshape(bsz, gops * 8, 768)).reshape(bsz, gops, 8, 768)
-        patch_proj = self.modality_projector(weighted_patches)
-
-        # Per-block LayerNorm so all three visual streams reach GPT-2 with
-        # comparable magnitudes. Without this, the Action Encoder's output
-        # (norm ~89) dwarfs CLS (~14) and patches (~11); GPT-2 then dampens
-        # the loud rows and reads almost everything from CLS.
         cls_proj = self.cls_block_ln(cls_proj)
-        act_proj = self.act_block_ln(act_proj)
-        patch_proj = self.patch_block_ln(patch_proj)
-
         t_embed = self.temporal_embed[:, :gops, :]
-
         cls = cls_proj + t_embed + self.type_embed[:, 0:1, :]
 
+        # CLS-only mode: no action or patch tokens
+        if not self.use_action_tokens or action_tokens is None:
+            return cls
+
+        act_proj = self.modality_projector(action_tokens.reshape(bsz, gops * 8, 768)).reshape(bsz, gops, 8, 768)
+        act_proj = self.act_block_ln(act_proj)
         act = act_proj + t_embed.unsqueeze(2) + self.type_embed[:, 1:2, :].unsqueeze(2)
         act = act.view(bsz, gops * 8, 768)
 
+        # CLS + Action mode: no patch tokens
+        if not self.use_spatial_tokens or not self.agdtr_tokens or weighted_patches is None:
+            return torch.cat([cls, act], dim=1)
+
+        patch_proj = self.modality_projector(weighted_patches)
+        patch_proj = self.patch_block_ln(patch_proj)
         patch_temporal = torch.gather(
             t_embed.expand(bsz, -1, -1),
             dim=1,
@@ -516,42 +554,51 @@ class FocalCapPhase2(nn.Module):
             else:
                 valid_gop_mask = (1 - input_mask_gop.long()).bool()
 
-        motion_tokens, residual_tokens = self._extract_motion_residual_tokens(
-            motion_vectors,
-            input_mask_mv,
-            residual,
-            input_mask_res,
-            clip_i_cls,
-        )
+        # ── Conditionally compute Action / Patch blocks ──
+        zero_diag = torch.tensor(0.0, device=clip_i_cls.device)
+        action = None
+        routed = None
+        action_norm = budget_mean = budget_std = patch_diversity = zero_diag
+        gate_mean = zero_diag
 
-        bg_patches = clip_i_spatial.reshape(bsz * gops, 196, 768)
-        action_bg = self.action_encoder(motion_tokens, residual_tokens, bg_patches)
-        action = action_bg.view(bsz, gops, 8, 768)
+        if self.use_action_tokens:
+            motion_tokens, residual_tokens = self._extract_motion_residual_tokens(
+                motion_vectors,
+                input_mask_mv,
+                residual,
+                input_mask_res,
+                clip_i_cls,
+            )
+            bg_patches = clip_i_spatial.reshape(bsz * gops, 196, 768)
+            action_bg = self.action_encoder(motion_tokens, residual_tokens, bg_patches)
+            action = action_bg.view(bsz, gops, 8, 768)
 
-        budgets = self.budget_allocator(clip_i_cls, action, valid_gop_mask)
-        routed = self.patch_router(clip_i_cls, action, clip_i_spatial, budgets)
+            with torch.no_grad():
+                action_norm = action.float().norm(dim=-1).mean()
 
-        # Diagnostics: per-batch health signals for the AGDTR + Action stack.
-        with torch.no_grad():
-            action_norm = action.float().norm(dim=-1).mean()
-            budgets_f = budgets.float()
-            valid_gops = valid_gop_mask.float().sum(dim=1).clamp_min(1.0)
-            budget_mean = (budgets_f.sum(dim=1) / valid_gops).mean()
-            budget_std = budgets_f.std(dim=1, unbiased=False).mean()
-            patch_indices_t = routed["patch_indices"]
-            patch_unique = (patch_indices_t.float().std(dim=1) > 0).float().mean()
-            patch_diversity = torch.tensor(0.0, device=action.device)
-            for b in range(bsz):
-                idx_b = patch_indices_t[b]
-                patch_diversity = patch_diversity + (idx_b.unique().numel() / max(int(idx_b.numel()), 1))
-            patch_diversity = patch_diversity / max(bsz, 1)
+        if self.use_action_tokens and self.use_spatial_tokens:
+            budgets = self.budget_allocator(clip_i_cls, action, valid_gop_mask)
+            routed = self.patch_router(clip_i_cls, action, clip_i_spatial, budgets)
+
+            with torch.no_grad():
+                budgets_f = budgets.float()
+                valid_gops = valid_gop_mask.float().sum(dim=1).clamp_min(1.0)
+                budget_mean = (budgets_f.sum(dim=1) / valid_gops).mean()
+                budget_std = budgets_f.std(dim=1, unbiased=False).mean()
+                patch_indices_t = routed["patch_indices"]
+                patch_diversity = torch.tensor(0.0, device=clip_i_cls.device)
+                for b in range(bsz):
+                    idx_b = patch_indices_t[b]
+                    patch_diversity = patch_diversity + (idx_b.unique().numel() / max(int(idx_b.numel()), 1))
+                patch_diversity = patch_diversity / max(bsz, 1)
+            gate_mean = routed["gate_mean"]
 
         visual = self._build_visual_payload(
             clip_i_cls=clip_i_cls,
             action_tokens=action,
-            weighted_patches=routed["weighted_patches"],
-            patch_indices=routed["patch_indices"],
-            patch_gop_ids=routed["patch_gop_ids"],
+            weighted_patches=routed["weighted_patches"] if routed is not None else None,
+            patch_indices=routed["patch_indices"] if routed is not None else None,
+            patch_gop_ids=routed["patch_gop_ids"] if routed is not None else None,
         )
 
         # Post-projection magnitude probe — tells you whether GPT-2 even SEES
@@ -560,25 +607,47 @@ class FocalCapPhase2(nn.Module):
         # tiny, the Modality Projector has zeroed out the action stream.
         with torch.no_grad():
             cls_block = visual[:, :gops, :]
-            act_block = visual[:, gops:gops + gops * 8, :]
-            patch_block = visual[:, gops + gops * 8:, :]
+            if self.use_action_tokens:
+                act_block = visual[:, gops:gops + gops * 8, :]
+                act_norm_post = act_block.float().norm(dim=-1).mean()
+            else:
+                act_block = visual[:, :0, :]  # empty tensor
+                act_norm_post = torch.tensor(0.0, device=visual.device)
+            if self.use_action_tokens and self.use_spatial_tokens:
+                patch_block = visual[:, gops + gops * 8:, :]
+                patch_norm_post = (
+                    patch_block.float().norm(dim=-1).mean()
+                    if patch_block.shape[1] > 0
+                    else torch.tensor(0.0, device=visual.device)
+                )
+            else:
+                patch_block = visual[:, :0, :]  # empty tensor
+                patch_norm_post = torch.tensor(0.0, device=visual.device)
             cls_norm_post = cls_block.float().norm(dim=-1).mean()
-            act_norm_post = act_block.float().norm(dim=-1).mean()
-            patch_norm_post = patch_block.float().norm(dim=-1).mean()
 
         # Optional block-dropout: during training, randomly suppress one block
         # type so GPT-2 cannot collapse to relying on a single source. Default
         # off (p=0); flip via base.yaml if attribution metrics show dominance.
-        if self.training and self.block_dropout_p > 0.0:
+        # Only applies to the blocks that are actually present in the visual payload.
+        n_active_blocks = 1 + int(self.use_action_tokens) + int(self.use_spatial_tokens and self.use_action_tokens)
+        if self.training and self.block_dropout_p > 0.0 and n_active_blocks >= 2:
             r = torch.rand(1, device=visual.device).item()
             if r < self.block_dropout_p:
-                which = int(torch.randint(0, 3, (1,)).item())
-                if which == 0:
-                    visual = torch.cat([torch.zeros_like(cls_block), act_block, patch_block], dim=1)
-                elif which == 1:
-                    visual = torch.cat([cls_block, torch.zeros_like(act_block), patch_block], dim=1)
-                else:
-                    visual = torch.cat([cls_block, act_block, torch.zeros_like(patch_block)], dim=1)
+                which = int(torch.randint(0, n_active_blocks, (1,)).item())
+                if n_active_blocks == 3:
+                    # Full model: cls / action / patch
+                    if which == 0:
+                        visual = torch.cat([torch.zeros_like(cls_block), act_block, patch_block], dim=1)
+                    elif which == 1:
+                        visual = torch.cat([cls_block, torch.zeros_like(act_block), patch_block], dim=1)
+                    else:
+                        visual = torch.cat([cls_block, act_block, torch.zeros_like(patch_block)], dim=1)
+                elif n_active_blocks == 2:
+                    # CLS + Action only
+                    if which == 0:
+                        visual = torch.cat([torch.zeros_like(cls_block), act_block], dim=1)
+                    else:
+                        visual = torch.cat([cls_block, torch.zeros_like(act_block)], dim=1)
 
         vis_end = self.vis_end.expand(bsz, -1, -1)
 
@@ -614,31 +683,41 @@ class FocalCapPhase2(nn.Module):
         # attention from the caption tokens lands on the [CLS / Action / Patch]
         # blocks. If patch_attn ≪ cls_attn, GPT-2 is largely ignoring the AGDTR.
         cls_attn = act_attn = patch_attn = torch.tensor(0.0, device=visual.device)
+        attn_aux_loss = torch.tensor(0.0, device=visual.device)
         if request_attn and out.attentions is not None:
-            with torch.no_grad():
-                vis_n = visual.shape[1]
-                cls_end = gops
-                act_end = gops + gops * 8
-                # Average attention mass over all layers and heads, restricted
-                # to caption-token rows (everything past VIS_END+BOS).
-                tot_cls = tot_act = tot_pat = torch.tensor(0.0, device=visual.device)
-                for layer_attn in out.attentions:
-                    a = torch.nan_to_num(layer_attn.float(), nan=0.0).mean(dim=1)
-                    cap_rows = a[:, vis_n + 1:, :]      # caption queries only
-                    tot_cls = tot_cls + cap_rows[:, :, :cls_end].sum(dim=-1).mean()
-                    tot_act = tot_act + cap_rows[:, :, cls_end:act_end].sum(dim=-1).mean()
-                    tot_pat = tot_pat + cap_rows[:, :, act_end:vis_n].sum(dim=-1).mean()
-                n_layers = max(float(len(out.attentions)), 1.0)
-                cls_attn = tot_cls / n_layers
-                act_attn = tot_act / n_layers
-                patch_attn = tot_pat / n_layers
+            vis_n = visual.shape[1]
+            cls_end = gops
+            act_end = gops + gops * 8
+            # Average attention mass over all layers and heads, restricted
+            # to caption-token rows (everything past VIS_END+BOS).
+            tot_cls = tot_act = tot_pat = torch.tensor(0.0, device=visual.device)
+            for layer_attn in out.attentions:
+                a = torch.nan_to_num(layer_attn.float(), nan=0.0).mean(dim=1)
+                cap_rows = a[:, vis_n + 1:, :]      # caption queries only
+                tot_cls = tot_cls + cap_rows[:, :, :cls_end].sum(dim=-1).mean()
+                tot_act = tot_act + cap_rows[:, :, cls_end:act_end].sum(dim=-1).mean()
+                tot_pat = tot_pat + cap_rows[:, :, act_end:vis_n].sum(dim=-1).mean()
+            n_layers = max(float(len(out.attentions)), 1.0)
+            cls_attn = tot_cls / n_layers
+            act_attn = tot_act / n_layers
+            patch_attn = tot_pat / n_layers
+
+            # Auxiliary hinge loss: penalize when patch attention share drops
+            # below target_share. This gives explicit gradient signal for GPT-2
+            # to attend to patch tokens instead of collapsing everything to CLS.
+            attn_total = (cls_attn + act_attn + patch_attn).detach().clamp_min(1e-6)
+            # patch_share tracks gradient through patch_attn only
+            patch_share = patch_attn / attn_total
+            target_share = 0.15
+            attn_aux_loss = F.relu(target_share - patch_share) * 2.0
+
         self._fwd_step += 1
 
         return {
             "logits": out.logits,
             "labels": full_labels,
-            "gop_budgets": budgets,
-            "gate_mean": routed["gate_mean"],
+            "gop_budgets": budgets if routed is not None else torch.zeros(1, device=visual.device),
+            "gate_mean": gate_mean,
             "action_norm": action_norm,
             "budget_mean": budget_mean,
             "budget_std": budget_std,
@@ -649,6 +728,7 @@ class FocalCapPhase2(nn.Module):
             "attn_cls_mass": cls_attn,
             "attn_act_mass": act_attn,
             "attn_patch_mass": patch_attn,
+            "attn_aux_loss": attn_aux_loss,
         }
 
     @torch.no_grad()
@@ -688,28 +768,33 @@ class FocalCapPhase2(nn.Module):
         else:
             valid_gop_mask = (~input_mask_gop.bool()) if input_mask_gop.dtype == torch.bool else (1 - input_mask_gop.long()).bool()
 
-        motion_tokens, residual_tokens = self._extract_motion_residual_tokens(
-            motion_vectors,
-            input_mask_mv,
-            residual,
-            input_mask_res,
-            clip_i_cls,
-        )
+        action = None
+        routed = None
 
-        action = self.action_encoder(
-            motion_tokens,
-            residual_tokens,
-            clip_i_spatial.view(bsz * gops, 196, 768),
-        ).view(bsz, gops, 8, 768)
+        if self.use_action_tokens:
+            motion_tokens, residual_tokens = self._extract_motion_residual_tokens(
+                motion_vectors,
+                input_mask_mv,
+                residual,
+                input_mask_res,
+                clip_i_cls,
+            )
+            action = self.action_encoder(
+                motion_tokens,
+                residual_tokens,
+                clip_i_spatial.view(bsz * gops, 196, 768),
+            ).view(bsz, gops, 8, 768)
 
-        budgets = self.budget_allocator(clip_i_cls, action, valid_gop_mask)
-        routed = self.patch_router(clip_i_cls, action, clip_i_spatial, budgets)
+        if self.use_action_tokens and self.use_spatial_tokens:
+            budgets = self.budget_allocator(clip_i_cls, action, valid_gop_mask)
+            routed = self.patch_router(clip_i_cls, action, clip_i_spatial, budgets)
+
         visual = self._build_visual_payload(
             clip_i_cls=clip_i_cls,
             action_tokens=action,
-            weighted_patches=routed["weighted_patches"],
-            patch_indices=routed["patch_indices"],
-            patch_gop_ids=routed["patch_gop_ids"],
+            weighted_patches=routed["weighted_patches"] if routed is not None else None,
+            patch_indices=routed["patch_indices"] if routed is not None else None,
+            patch_gop_ids=routed["patch_gop_ids"] if routed is not None else None,
         )
 
         vis_end = self.vis_end.expand(bsz, -1, -1)

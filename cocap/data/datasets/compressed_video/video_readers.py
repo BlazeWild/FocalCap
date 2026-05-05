@@ -578,8 +578,8 @@ def read_frames_compressed_domain(
         return ret, True
 
     except Exception as e:
-        # Quiet, single-line warning instead of full traceback. The dataset's outer
-        # `Skipping invalid compressed-video sample` warning gives the same info with
-        # de-duplication; a few corrupt MP4s in the corpus are expected.
-        logger.warning("video read failed for %s: %s: %s", video_path, type(e).__name__, e)
+        # The dataset's fast estimator overestimates valid GOPs for videos encoded
+        # with very short GOP structures. When this fails, dataset_vatex.py catches
+        # it and gracefully skips the video. We silently raise here to avoid spamming
+        # the console with alarming errors for expected behavior.
         raise
