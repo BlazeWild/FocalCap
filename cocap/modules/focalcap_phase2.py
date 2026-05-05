@@ -353,14 +353,6 @@ class FocalCapPhase2(nn.Module):
         self.patch_router = PatchRouter()
         self.modality_projector = ModalityProjector()
 
-        # Per-block magnitude equalizers, applied AFTER the modality projector
-        # so each stream enters GPT-2 with O(1) std. Action Encoder output was
-        # ~6x louder than CLS pre-norm; GPT-2 attention then dampened it,
-        # causing CLS to absorb most attention mass.
-        self.cls_block_ln = nn.LayerNorm(768)
-        self.act_block_ln = nn.LayerNorm(768)
-        self.patch_block_ln = nn.LayerNorm(768)
-
         # Freeze modules that won't be used (saves memory + ensures no stale gradients)
         if not self.use_action_tokens:
             self._freeze_module(self.action_encoder)
@@ -484,7 +476,6 @@ class FocalCapPhase2(nn.Module):
         bsz, gops, _ = clip_i_cls.shape
 
         cls_proj = self.modality_projector(clip_i_cls)
-        cls_proj = self.cls_block_ln(cls_proj)
         t_embed = self.temporal_embed[:, :gops, :]
         cls = cls_proj + t_embed + self.type_embed[:, 0:1, :]
 
@@ -493,7 +484,6 @@ class FocalCapPhase2(nn.Module):
             return cls
 
         act_proj = self.modality_projector(action_tokens.reshape(bsz, gops * 8, 768)).reshape(bsz, gops, 8, 768)
-        act_proj = self.act_block_ln(act_proj)
         act = act_proj + t_embed.unsqueeze(2) + self.type_embed[:, 1:2, :].unsqueeze(2)
         act = act.view(bsz, gops * 8, 768)
 
@@ -502,7 +492,6 @@ class FocalCapPhase2(nn.Module):
             return torch.cat([cls, act], dim=1)
 
         patch_proj = self.modality_projector(weighted_patches)
-        patch_proj = self.patch_block_ln(patch_proj)
         patch_temporal = torch.gather(
             t_embed.expand(bsz, -1, -1),
             dim=1,
