@@ -309,6 +309,7 @@ class FocalCapPhase2(nn.Module):
         attn_aux_every: int = 0,
         attn_aux_target_share: float = 0.15,
         attn_aux_weight: float = 2.0,
+        regularizer_warmup_steps: int = 0,
         use_action_tokens: bool = True,
         use_spatial_tokens: bool = True,
     ):
@@ -337,6 +338,9 @@ class FocalCapPhase2(nn.Module):
         self.attn_aux_every = int(attn_aux_every)
         self.attn_aux_target_share = float(attn_aux_target_share)
         self.attn_aux_weight = float(attn_aux_weight)
+        # Delay regularization (dropout + attn-aux) until the model has learned
+        # a reasonable base captioning policy. This avoids early collapse.
+        self.regularizer_warmup_steps = max(int(regularizer_warmup_steps), 0)
         self._fwd_step = 0
         self.agdtr_tokens = bool(agdtr_tokens)
         
@@ -631,7 +635,8 @@ class FocalCapPhase2(nn.Module):
         # off (p=0); flip via base.yaml if attribution metrics show dominance.
         # Only applies to the blocks that are actually present in the visual payload.
         n_active_blocks = 1 + int(self.use_action_tokens) + int(self.use_spatial_tokens and self.use_action_tokens)
-        if self.training and n_active_blocks >= 2:
+        reg_ready = self.training and (self._fwd_step >= self.regularizer_warmup_steps)
+        if reg_ready and n_active_blocks >= 2:
             use_custom_block_dropout = (
                 self.block_dropout_cls_p > 0.0
                 or self.block_dropout_action_p > 0.0
@@ -706,7 +711,7 @@ class FocalCapPhase2(nn.Module):
         full_labels = torch.cat([ignore_prefix, text_labels], dim=1)
 
         probe_step = self.training and self.attn_probe_every > 0 and (self._fwd_step % self.attn_probe_every == 0)
-        aux_step = self.training and self.attn_aux_every > 0 and (self._fwd_step % self.attn_aux_every == 0)
+        aux_step = reg_ready and self.attn_aux_every > 0 and (self._fwd_step % self.attn_aux_every == 0)
         request_attn = probe_step or aux_step
         out = self.gpt2(
             inputs_embeds=inputs_embeds,

@@ -42,7 +42,7 @@ def main():
     clip_path = str(base / "model_zoo" / "clip_model" / "ViT-B-16.pt")
     motion_ckpt = str(base / "logs" / "vatex_pretrain" / "motion_encoder_best.pt")
 
-    ckpt = str(base / "logs" / "vatex_captioning" / "ablation_full" / "checkpoints" / "best" / "last-v1.ckpt")
+    ckpt = str(base / "logs" / "vatex_captioning" / "ablation_full_fastsafe" / "checkpoints" / "best" / "last.ckpt")
     print(f"using ckpt: {ckpt}")
 
     me = MotionTransformer(embed_dim=384, num_layers=4, num_residual_queries=4, use_residual_stream=True)
