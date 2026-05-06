@@ -49,6 +49,17 @@ model:
     #   CLS-only (baseline) → CLS+Action → Full
     use_action_tokens: true
     use_spatial_tokens: true
+    # Number of action tokens per GOP (8 GOPs => total action tokens = 8 * value).
+    action_tokens_per_gop: 2
+    # Action token export: learned pooling beats fixed index subsampling.
+    action_use_learned_pooling: true
+    # Let residual cues influence exported motion/action tokens.
+    action_fuse_residual_into_motion: true
+    # Router query: false = action-only (prevents CLS shortcut dominance).
+    router_use_cls_query: false
+    # Softer anti-duplicate penalty lets useful repeated object focus survive.
+    router_duplicate_penalty: 1.25
+    router_penalty_decay: 0.90
     # Legacy one-block-dropout probability. Kept at 0 because we now use the
     # per-block schedule below to bias CLS suppression.
     block_dropout_p: 0.00
@@ -82,7 +93,7 @@ trainer:
   devices: 1
   strategy: "auto"
   max_epochs: 20
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 2
   gradient_clip_val: 1.0
   log_every_n_steps: 10
   num_sanity_val_steps: 0
@@ -119,10 +130,10 @@ trainer:
 train_dataloader:
   dataset:
     split: "train"
-  num_workers: 24
-  batch_size: 8
-  prefetch_factor: 4
-  persistent_workers: true
+  num_workers: 16
+  batch_size: 4
+  prefetch_factor: 3
+  persistent_workers: false
   shuffle: true
   pin_memory: true
   multiprocessing_context: null
@@ -130,10 +141,10 @@ train_dataloader:
 val_dataloader:
   dataset:
     split: "val"
-  num_workers: 16
-  batch_size: 8
-  prefetch_factor: 2
-  persistent_workers: true
+  num_workers: 8
+  batch_size: 4
+  prefetch_factor: 3
+  persistent_workers: false
   shuffle: false
   pin_memory: true
   multiprocessing_context: null

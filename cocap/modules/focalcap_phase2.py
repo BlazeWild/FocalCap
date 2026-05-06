@@ -55,8 +55,19 @@ class CrossAttentionBlock(nn.Module):
 
 
 class ActionEncoder(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        action_tokens_per_gop: int = 8,
+        use_learned_pooling: bool = True,
+        fuse_residual_into_motion: bool = True,
+    ):
         super().__init__()
+        self.action_tokens_per_gop = int(action_tokens_per_gop)
+        if not (1 <= self.action_tokens_per_gop <= 8):
+            raise ValueError(f"action_tokens_per_gop must be in [1, 8], got {self.action_tokens_per_gop}")
+        self.use_learned_pooling = bool(use_learned_pooling)
+        self.fuse_residual_into_motion = bool(fuse_residual_into_motion)
+
         self.motion_proj = nn.Linear(384, 768)
         self.residual_proj = nn.Linear(384, 768)
         self.proj_ln = nn.LayerNorm(768)
@@ -76,6 +87,8 @@ class ActionEncoder(nn.Module):
             CrossAttentionBlock(d_model=768, nhead=8, dim_feedforward=3072, dropout=0.1),
         ])
         self.final_ln = nn.LayerNorm(768)
+        self.pool_ln = nn.LayerNorm(768)
+        self.pool_queries = nn.Parameter(torch.randn(1, self.action_tokens_per_gop, 768) * 0.02)
 
     def forward(
         self,
@@ -97,12 +110,42 @@ class ActionEncoder(nn.Module):
             q, _ = layer(q, kv, need_weights=False)
 
         q = self.final_ln(q)
-        return q[:, :8, :]
+        motion_out = q[:, :8, :]
+        if self.fuse_residual_into_motion:
+            # Residual queries encode appearance-change cues; add a light global
+            # residual context to motion slots so exported action tokens carry both.
+            residual_ctx = q[:, 8:, :].mean(dim=1, keepdim=True)
+            motion_out = motion_out + residual_ctx
+        if self.action_tokens_per_gop == 8:
+            return motion_out
+
+        if not self.use_learned_pooling:
+            select_idx = torch.linspace(
+                0,
+                motion_out.shape[1] - 1,
+                steps=self.action_tokens_per_gop,
+                device=motion_out.device,
+            ).round().long()
+            return motion_out.index_select(1, select_idx)
+
+        # Learned pooling avoids hard-coded [0,7]-style subsampling and lets the
+        # model keep the most useful temporal slots for captioning.
+        q_pool = self.pool_ln(self.pool_queries.expand(motion_out.shape[0], -1, -1))
+        k_pool = self.pool_ln(motion_out)
+        scale = motion_out.shape[-1] ** -0.5
+        attn = torch.matmul(q_pool, k_pool.transpose(1, 2)) * scale
+        weights = F.softmax(attn, dim=-1)
+        pooled = torch.matmul(weights, motion_out)
+        return pooled
 
 
 class BudgetAllocator(nn.Module):
-    def __init__(self):
+    def __init__(self, action_tokens_per_gop: int = 8):
         super().__init__()
+        self.action_tokens_per_gop = int(action_tokens_per_gop)
+        if self.action_tokens_per_gop < 1:
+            raise ValueError(f"action_tokens_per_gop must be >=1, got {self.action_tokens_per_gop}")
+
         self.budget_token = nn.Parameter(torch.randn(1, 1, 768) * 0.02)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=768,
@@ -123,12 +166,12 @@ class BudgetAllocator(nn.Module):
         bsz, gops, _ = cls_tokens.shape
         x = torch.cat([
             cls_tokens.reshape(bsz * gops, 1, 768),
-            action_tokens.reshape(bsz * gops, 8, 768),
+            action_tokens.reshape(bsz * gops, self.action_tokens_per_gop, 768),
             self.budget_token.expand(bsz * gops, -1, -1),
         ], dim=1)
 
         x = self.encoder(x)
-        budget_repr = x[:, 9, :]
+        budget_repr = x[:, 1 + self.action_tokens_per_gop, :]
         scores = self.score_head(budget_repr).view(bsz, gops)
 
         valid = valid_gop_mask.bool()
@@ -156,8 +199,20 @@ class BudgetAllocator(nn.Module):
 
 
 class PatchRouter(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        action_tokens_per_gop: int = 8,
+        use_cls_in_query: bool = False,
+        duplicate_penalty: float = 1.25,
+        penalty_decay: float = 0.90,
+    ):
         super().__init__()
+        self.action_tokens_per_gop = int(action_tokens_per_gop)
+        if self.action_tokens_per_gop < 1:
+            raise ValueError(f"action_tokens_per_gop must be >=1, got {self.action_tokens_per_gop}")
+        self.use_cls_in_query = bool(use_cls_in_query)
+        self.duplicate_penalty = float(duplicate_penalty)
+        self.penalty_decay = float(penalty_decay)
         self.scorer = CrossAttentionBlock(d_model=768, nhead=8, dim_feedforward=3072, dropout=0.1)
 
     def _pack_fixed(
@@ -198,13 +253,21 @@ class PatchRouter(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         bsz, gops, npatch, _ = clip_patches.shape
 
-        q = torch.cat([cls_tokens.unsqueeze(2), action_tokens], dim=2).reshape(bsz * gops, 9, 768)
+        if self.use_cls_in_query:
+            q = torch.cat([cls_tokens.unsqueeze(2), action_tokens], dim=2).reshape(
+                bsz * gops,
+                1 + self.action_tokens_per_gop,
+                768,
+            )
+        else:
+            # Action-only query prevents CLS shortcut from dominating patch routing.
+            q = action_tokens.reshape(bsz * gops, self.action_tokens_per_gop, 768)
         kv = clip_patches.reshape(bsz * gops, npatch, 768)
 
         _, attn_w = self.scorer(q, kv, need_weights=True)
         raw = attn_w.mean(dim=1).mean(dim=1).reshape(bsz, gops, npatch)
 
-        penalty_mask = torch.zeros((bsz, npatch), device=raw.device, dtype=raw.dtype)
+        duplicate_mask = torch.zeros((bsz, npatch), device=raw.device, dtype=raw.dtype)
         weighted_chunks: List[torch.Tensor] = []
         index_chunks: List[torch.Tensor] = []
         gop_chunks: List[torch.Tensor] = []
@@ -212,7 +275,9 @@ class PatchRouter(nn.Module):
         gate_chunks: List[torch.Tensor] = []
 
         for t in range(gops):
-            cur_scores = raw[:, t, :] + penalty_mask
+            if t > 0 and self.penalty_decay < 1.0:
+                duplicate_mask = duplicate_mask * self.penalty_decay
+            cur_scores = raw[:, t, :] - duplicate_mask
             kmax = int(gop_budgets[:, t].max().item())
             if kmax <= 0:
                 continue
@@ -240,7 +305,12 @@ class PatchRouter(nn.Module):
             mask_chunks.append(valid_k)
             gate_chunks.append(gates_t)
 
-            penalty_mask = penalty_mask.scatter_add(1, top_idx, valid_k.float() * -10000.0)
+            if self.duplicate_penalty > 0.0:
+                duplicate_mask = duplicate_mask.scatter_add(
+                    1,
+                    top_idx,
+                    valid_k.float() * self.duplicate_penalty,
+                )
 
         if not weighted_chunks:
             zeros_t = torch.zeros((bsz, 64, 768), device=clip_patches.device, dtype=clip_patches.dtype)
@@ -310,8 +380,14 @@ class FocalCapPhase2(nn.Module):
         attn_aux_target_share: float = 0.15,
         attn_aux_weight: float = 2.0,
         regularizer_warmup_steps: int = 0,
+        action_tokens_per_gop: int = 8,
+        action_use_learned_pooling: bool = True,
+        action_fuse_residual_into_motion: bool = True,
         use_action_tokens: bool = True,
         use_spatial_tokens: bool = True,
+        router_use_cls_query: bool = False,
+        router_duplicate_penalty: float = 1.25,
+        router_penalty_decay: float = 0.90,
     ):
         super().__init__()
 
@@ -321,6 +397,9 @@ class FocalCapPhase2(nn.Module):
         # Both true = full model (CLS + Action + Spatial patches via AGDTR).
         self.use_action_tokens = bool(use_action_tokens)
         self.use_spatial_tokens = bool(use_spatial_tokens)
+        self.action_tokens_per_gop = int(action_tokens_per_gop)
+        if not (1 <= self.action_tokens_per_gop <= 8):
+            raise ValueError(f"action_tokens_per_gop must be in [1, 8], got {self.action_tokens_per_gop}")
         if self.use_spatial_tokens and not self.use_action_tokens:
             # Spatial routing needs action tokens for budget/scorer queries
             raise ValueError("use_spatial_tokens requires use_action_tokens=true")
@@ -343,6 +422,11 @@ class FocalCapPhase2(nn.Module):
         self.regularizer_warmup_steps = max(int(regularizer_warmup_steps), 0)
         self._fwd_step = 0
         self.agdtr_tokens = bool(agdtr_tokens)
+        self.action_use_learned_pooling = bool(action_use_learned_pooling)
+        self.action_fuse_residual_into_motion = bool(action_fuse_residual_into_motion)
+        self.router_use_cls_query = bool(router_use_cls_query)
+        self.router_duplicate_penalty = float(router_duplicate_penalty)
+        self.router_penalty_decay = float(router_penalty_decay)
         
         self.motion_encoder = motion_encoder
         # Phase-2 must discard Phase-1 teacher heads.
@@ -364,9 +448,18 @@ class FocalCapPhase2(nn.Module):
                 self.clip = build_clip(clip_state_dict)
                 self._freeze_module(self.clip)
 
-        self.action_encoder = ActionEncoder()
-        self.budget_allocator = BudgetAllocator()
-        self.patch_router = PatchRouter()
+        self.action_encoder = ActionEncoder(
+            action_tokens_per_gop=self.action_tokens_per_gop,
+            use_learned_pooling=self.action_use_learned_pooling,
+            fuse_residual_into_motion=self.action_fuse_residual_into_motion,
+        )
+        self.budget_allocator = BudgetAllocator(action_tokens_per_gop=self.action_tokens_per_gop)
+        self.patch_router = PatchRouter(
+            action_tokens_per_gop=self.action_tokens_per_gop,
+            use_cls_in_query=self.router_use_cls_query,
+            duplicate_penalty=self.router_duplicate_penalty,
+            penalty_decay=self.router_penalty_decay,
+        )
         self.modality_projector = ModalityProjector()
 
         # Freeze modules that won't be used (saves memory + ensures no stale gradients)
@@ -499,9 +592,11 @@ class FocalCapPhase2(nn.Module):
         if not self.use_action_tokens or action_tokens is None:
             return cls
 
-        act_proj = self.modality_projector(action_tokens.reshape(bsz, gops * 8, 768)).reshape(bsz, gops, 8, 768)
+        act_proj = self.modality_projector(
+            action_tokens.reshape(bsz, gops * self.action_tokens_per_gop, 768)
+        ).reshape(bsz, gops, self.action_tokens_per_gop, 768)
         act = act_proj + t_embed.unsqueeze(2) + self.type_embed[:, 1:2, :].unsqueeze(2)
-        act = act.view(bsz, gops * 8, 768)
+        act = act.view(bsz, gops * self.action_tokens_per_gop, 768)
 
         # CLS + Action mode: no patch tokens
         if not self.use_spatial_tokens or not self.agdtr_tokens or weighted_patches is None:
@@ -576,7 +671,7 @@ class FocalCapPhase2(nn.Module):
             )
             bg_patches = clip_i_spatial.reshape(bsz * gops, 196, 768)
             action_bg = self.action_encoder(motion_tokens, residual_tokens, bg_patches)
-            action = action_bg.view(bsz, gops, 8, 768)
+            action = action_bg.view(bsz, gops, self.action_tokens_per_gop, 768)
 
             with torch.no_grad():
                 action_norm = action.float().norm(dim=-1).mean()
@@ -613,13 +708,13 @@ class FocalCapPhase2(nn.Module):
         with torch.no_grad():
             cls_block = visual[:, :gops, :]
             if self.use_action_tokens:
-                act_block = visual[:, gops:gops + gops * 8, :]
+                act_block = visual[:, gops:gops + gops * self.action_tokens_per_gop, :]
                 act_norm_post = act_block.float().norm(dim=-1).mean()
             else:
                 act_block = visual[:, :0, :]  # empty tensor
                 act_norm_post = torch.tensor(0.0, device=visual.device)
             if self.use_action_tokens and self.use_spatial_tokens:
-                patch_block = visual[:, gops + gops * 8:, :]
+                patch_block = visual[:, gops + gops * self.action_tokens_per_gop:, :]
                 patch_norm_post = (
                     patch_block.float().norm(dim=-1).mean()
                     if patch_block.shape[1] > 0
@@ -728,7 +823,7 @@ class FocalCapPhase2(nn.Module):
         if request_attn and out.attentions is not None:
             vis_n = visual.shape[1]
             cls_end = gops
-            act_end = gops + gops * 8
+            act_end = gops + gops * self.action_tokens_per_gop
             # Average attention mass over all layers and heads, restricted
             # to caption-token rows (everything past VIS_END+BOS).
             tot_cls = tot_act = tot_pat = torch.tensor(0.0, device=visual.device)
@@ -824,7 +919,7 @@ class FocalCapPhase2(nn.Module):
                 motion_tokens,
                 residual_tokens,
                 clip_i_spatial.view(bsz * gops, 196, 768),
-            ).view(bsz, gops, 8, 768)
+            ).view(bsz, gops, self.action_tokens_per_gop, 768)
 
         if self.use_action_tokens and self.use_spatial_tokens:
             budgets = self.budget_allocator(clip_i_cls, action, valid_gop_mask)

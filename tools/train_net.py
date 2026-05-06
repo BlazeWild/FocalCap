@@ -26,6 +26,7 @@ def train(
     trainer: pl.Trainer,
     ckpt_path: str = None,
     weights_only_ckpt: str = "",
+    auto_fallback_weights_only_on_optim_mismatch: bool = True,
 ):
     if ckpt_path is None:
         ckpt_path = os.environ.get("CKPT_PATH")
@@ -53,12 +54,48 @@ def train(
     except Exception as exc:
         logger.warning("Could not print model summary: %s", exc)
 
-    trainer.fit(
-        model=model,
-        train_dataloaders=train_dataloader,
-        val_dataloaders=val_dataloader,
-        ckpt_path=ckpt_path,
-    )
+    try:
+        trainer.fit(
+            model=model,
+            train_dataloaders=train_dataloader,
+            val_dataloaders=val_dataloader,
+            ckpt_path=ckpt_path,
+        )
+    except (ValueError, RuntimeError) as exc:
+        msg = str(exc)
+        is_optimizer_group_mismatch = "different number of parameter groups" in msg
+        is_model_key_mismatch = (
+            "Missing key(s) in state_dict" in msg
+            or "Unexpected key(s) in state_dict" in msg
+            or "size mismatch for" in msg
+        )
+        can_fallback = (
+            auto_fallback_weights_only_on_optim_mismatch
+            and ckpt_path
+            and (is_optimizer_group_mismatch or is_model_key_mismatch)
+        )
+        if not can_fallback:
+            raise
+
+        logger.warning(
+            "Resume failed due to checkpoint-state mismatch. "
+            "Falling back to weights-only load from ckpt_path=%s and restarting optimizer/scheduler state.",
+            ckpt_path,
+        )
+        raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = raw.get("state_dict", raw)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        logger.info(
+            "Fallback weights-only load complete (missing=%d unexpected=%d). Retrying fit with ckpt_path=None.",
+            len(missing),
+            len(unexpected),
+        )
+        trainer.fit(
+            model=model,
+            train_dataloaders=train_dataloader,
+            val_dataloaders=val_dataloader,
+            ckpt_path=None,
+        )
 
 
 if __name__ == "__main__":

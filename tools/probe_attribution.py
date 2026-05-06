@@ -8,6 +8,7 @@ on a small batch of real VATEX val samples.
 """
 import os
 import sys
+import argparse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -19,6 +20,25 @@ from cocap.modules.compressed_video.motion_encoder import MotionTransformer
 from cocap.modules.focalcap_phase2 import FocalCapPhase2
 from cocap.data.datasets.compressed_video.dataset_vatex import VATEXCaptioningDataset
 from cocap.data.datasets.compressed_video.video_text_base import CVConfig
+
+
+def infer_action_tokens_per_gop(ckpt_path: str, default: int = 8) -> int:
+    """Best-effort inference from run .hydra/config.yaml next to checkpoint."""
+    try:
+        import yaml  # lazy import to avoid hard dependency at module import time
+        ckpt_p = Path(ckpt_path).resolve()
+        # .../<run>/checkpoints/<best|latest>/file.ckpt -> <run>
+        run_root = ckpt_p.parents[2]
+        cfg_p = run_root / ".hydra" / "config.yaml"
+        if cfg_p.exists():
+            cfg = yaml.safe_load(cfg_p.read_text(encoding="utf-8"))
+            v = cfg.get("model", {}).get("cocap_model", {}).get("action_tokens_per_gop", default)
+            v = int(v)
+            if 1 <= v <= 8:
+                return v
+    except Exception:
+        pass
+    return int(default)
 
 
 def load_phase2_state_into_model(model: torch.nn.Module, lightning_ckpt_path: str) -> None:
@@ -36,14 +56,29 @@ def load_phase2_state_into_model(model: torch.nn.Module, lightning_ckpt_path: st
         print("  first missing:", miss[:5])
 
 
+def parse_args():
+    base = Path(__file__).resolve().parent.parent
+    default_ckpt = base / "logs" / "vatex_captioning" / "ablation_full_fastsafe" / "checkpoints" / "best" / "last.ckpt"
+    p = argparse.ArgumentParser(description="Probe CLS/Action/Patch attribution on VATEX val")
+    p.add_argument("--ckpt", type=str, default=str(default_ckpt), help="Phase-2 checkpoint path")
+    p.add_argument("--n_batches", type=int, default=8, help="Number of val batches to probe")
+    p.add_argument("--batch_size", type=int, default=4, help="Probe batch size")
+    p.add_argument("--num_workers", type=int, default=2, help="Probe workers")
+    p.add_argument("--max_videos", type=int, default=64, help="Max val videos for probe subset")
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
     base = Path(__file__).resolve().parent.parent
     gpt2_path = str(base / "model_zoo" / "gpt2_model")
     clip_path = str(base / "model_zoo" / "clip_model" / "ViT-B-16.pt")
     motion_ckpt = str(base / "logs" / "vatex_pretrain" / "motion_encoder_best.pt")
 
-    ckpt = str(base / "logs" / "vatex_captioning" / "ablation_full_fastsafe" / "checkpoints" / "best" / "last.ckpt")
+    ckpt = str(args.ckpt)
     print(f"using ckpt: {ckpt}")
+    action_tokens_per_gop = infer_action_tokens_per_gop(ckpt, default=8)
+    print(f"using action_tokens_per_gop: {action_tokens_per_gop}")
 
     me = MotionTransformer(embed_dim=384, num_layers=4, num_residual_queries=4, use_residual_stream=True)
     raw = torch.load(motion_ckpt, map_location="cpu", weights_only=False)
@@ -58,6 +93,7 @@ def main():
         use_lora=True,
         block_dropout_p=0.0,
         attn_probe_every=1,
+        action_tokens_per_gop=action_tokens_per_gop,
     )
     load_phase2_state_into_model(model, ckpt)
 
@@ -72,9 +108,9 @@ def main():
         max_words=50, max_frames=8, unfold_sentences=True,
         video_size=(224, 224), metadata=str(base / "dataset/vatex/VATEX_caption.json"),
         video_reader="read_frames_compressed_domain", cv_config=cv,
-        split="val", use_preextracted_features=False, captions_per_video=1, max_videos_per_split=64,
+        split="val", use_preextracted_features=False, captions_per_video=1, max_videos_per_split=int(args.max_videos),
     )
-    dl = DataLoader(ds, batch_size=4, num_workers=2, shuffle=False)
+    dl = DataLoader(ds, batch_size=int(args.batch_size), num_workers=int(args.num_workers), shuffle=False)
 
     metrics = {k: 0.0 for k in [
         "cls_norm_post", "act_norm_post", "patch_norm_post",
@@ -82,7 +118,7 @@ def main():
         "gate_mean", "budget_std", "patch_diversity",
     ]}
     n_batches = 0
-    n_target = 8
+    n_target = int(args.n_batches)
 
     with torch.no_grad():
         for batch in dl:
@@ -118,7 +154,7 @@ def main():
     for k in metrics:
         metrics[k] /= max(n_batches, 1)
 
-    print(f"\nProbed {n_batches} batches × bs=4 = {n_batches*4} val samples\n")
+    print(f"\nProbed {n_batches} batches x bs={int(args.batch_size)} = {n_batches*int(args.batch_size)} val samples\n")
     print("=== Post-projector L2 norms (per-token mean) ===")
     print(f"  cls_norm_post   = {metrics['cls_norm_post']:.3f}")
     print(f"  act_norm_post   = {metrics['act_norm_post']:.3f}")
