@@ -58,7 +58,7 @@ def load_phase2_state_into_model(model: torch.nn.Module, lightning_ckpt_path: st
 
 def parse_args():
     base = Path(__file__).resolve().parent.parent
-    default_ckpt = base / "logs" / "vatex_captioning" / "ablation_full_fastsafe" / "checkpoints" / "best" / "last.ckpt"
+    default_ckpt = base / "logs" / "vatex_captioning" / "ablation_full_archfix_v3" / "checkpoints" / "latest" / "latest-epoch000-step2298.ckpt"
     p = argparse.ArgumentParser(description="Probe CLS/Action/Patch attribution on VATEX val")
     p.add_argument("--ckpt", type=str, default=str(default_ckpt), help="Phase-2 checkpoint path")
     p.add_argument("--n_batches", type=int, default=8, help="Number of val batches to probe")

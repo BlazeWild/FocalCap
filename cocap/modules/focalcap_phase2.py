@@ -112,9 +112,13 @@ class ActionEncoder(nn.Module):
         q = self.final_ln(q)
         motion_out = q[:, :8, :]
         if self.fuse_residual_into_motion:
-            # Residual queries encode appearance-change cues; add a light global
-            # residual context to motion slots so exported action tokens carry both.
-            residual_ctx = q[:, 8:, :].mean(dim=1, keepdim=True)
+            # Residual queries encode appearance-change cues. Align residual
+            # slots to motion length before fusion (4->8 by repeat-interleave)
+            # so we preserve temporal structure without shape mismatch.
+            residual_ctx = q[:, 8:, :]
+            if residual_ctx.shape[1] != motion_out.shape[1]:
+                repeat = (motion_out.shape[1] + residual_ctx.shape[1] - 1) // max(residual_ctx.shape[1], 1)
+                residual_ctx = residual_ctx.repeat_interleave(repeat, dim=1)[:, : motion_out.shape[1], :]
             motion_out = motion_out + residual_ctx
         if self.action_tokens_per_gop == 8:
             return motion_out
@@ -222,9 +226,9 @@ class PatchRouter(nn.Module):
         gops: torch.Tensor,
         mask: torch.Tensor,
         total: int = 64,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz = toks.shape[0]
-        packed_t, packed_i, packed_g = [], [], []
+        packed_t, packed_i, packed_g, packed_m = [], [], [], []
         for b in range(bsz):
             vb = mask[b]
             t = toks[b][vb]
@@ -235,14 +239,22 @@ class PatchRouter(nn.Module):
                 packed_t.append(t[:total])
                 packed_i.append(i[:total])
                 packed_g.append(g[:total])
+                packed_m.append(torch.ones((total,), device=t.device, dtype=torch.bool))
             else:
                 pad_t = torch.zeros((total - n, toks.shape[-1]), device=t.device, dtype=t.dtype)
                 pad_i = torch.zeros((total - n,), device=i.device, dtype=i.dtype)
                 pad_g = torch.zeros((total - n,), device=g.device, dtype=g.dtype)
+                pad_m = torch.zeros((total - n,), device=t.device, dtype=torch.bool)
                 packed_t.append(torch.cat([t, pad_t], dim=0))
                 packed_i.append(torch.cat([i, pad_i], dim=0))
                 packed_g.append(torch.cat([g, pad_g], dim=0))
-        return torch.stack(packed_t, dim=0), torch.stack(packed_i, dim=0), torch.stack(packed_g, dim=0)
+                packed_m.append(torch.cat([torch.ones((n,), device=t.device, dtype=torch.bool), pad_m], dim=0))
+        return (
+            torch.stack(packed_t, dim=0),
+            torch.stack(packed_i, dim=0),
+            torch.stack(packed_g, dim=0),
+            torch.stack(packed_m, dim=0),
+        )
 
     def forward(
         self,
@@ -265,7 +277,11 @@ class PatchRouter(nn.Module):
         kv = clip_patches.reshape(bsz * gops, npatch, 768)
 
         _, attn_w = self.scorer(q, kv, need_weights=True)
-        raw = attn_w.mean(dim=1).mean(dim=1).reshape(bsz, gops, npatch)
+        # Use max() instead of mean() across action queries so that patches highly 
+        # relevant to *any* specific action token are preserved, rather than being 
+        # diluted by queries that ignore them.
+        raw, _ = attn_w.mean(dim=1).max(dim=1)
+        raw = raw.reshape(bsz, gops, npatch)
 
         duplicate_mask = torch.zeros((bsz, npatch), device=raw.device, dtype=raw.dtype)
         weighted_chunks: List[torch.Tensor] = []
@@ -316,10 +332,12 @@ class PatchRouter(nn.Module):
             zeros_t = torch.zeros((bsz, 64, 768), device=clip_patches.device, dtype=clip_patches.dtype)
             zeros_i = torch.zeros((bsz, 64), device=clip_patches.device, dtype=torch.long)
             zeros_g = torch.zeros((bsz, 64), device=clip_patches.device, dtype=torch.long)
+            zeros_m = torch.zeros((bsz, 64), device=clip_patches.device, dtype=torch.bool)
             return {
                 "weighted_patches": zeros_t,
                 "patch_indices": zeros_i,
                 "patch_gop_ids": zeros_g,
+                "patch_valid_mask": zeros_m,
                 "raw_scores": raw,
                 "gate_mean": torch.tensor(0.0, device=clip_patches.device),
             }
@@ -329,7 +347,7 @@ class PatchRouter(nn.Module):
         cat_g = torch.cat(gop_chunks, dim=1)
         cat_m = torch.cat(mask_chunks, dim=1)
 
-        weighted, indices, gop_ids = self._pack_fixed(cat_t, cat_i, cat_g, cat_m, total=64)
+        weighted, indices, gop_ids, valid_mask = self._pack_fixed(cat_t, cat_i, cat_g, cat_m, total=64)
 
         gate_vals = []
         for gates_t, mk in zip(gate_chunks, mask_chunks):
@@ -343,6 +361,7 @@ class PatchRouter(nn.Module):
             "weighted_patches": weighted,
             "patch_indices": indices,
             "patch_gop_ids": gop_ids,
+            "patch_valid_mask": valid_mask,
             "raw_scores": raw,
             "gate_mean": gate_mean,
         }
@@ -461,6 +480,11 @@ class FocalCapPhase2(nn.Module):
             penalty_decay=self.router_penalty_decay,
         )
         self.modality_projector = ModalityProjector()
+        # Per-modality post-projector normalization keeps CLS/Action/Patch
+        # token scales comparable before concatenation into GPT-2 prefix.
+        self.cls_post_ln = nn.LayerNorm(768)
+        self.action_post_ln = nn.LayerNorm(768)
+        self.patch_post_ln = nn.LayerNorm(768)
 
         # Freeze modules that won't be used (saves memory + ensures no stale gradients)
         if not self.use_action_tokens:
@@ -525,7 +549,10 @@ class FocalCapPhase2(nn.Module):
         if self.clip is not None:
             self.clip.eval()
         if self.motion_encoder is not None:
-            self.motion_encoder.eval()
+            if any(p.requires_grad for p in self.motion_encoder.parameters()) and self.training:
+                self.motion_encoder.train()
+            else:
+                self.motion_encoder.eval()
         self.gpt2.eval()
 
     def train(self, mode: bool = True):
@@ -581,10 +608,11 @@ class FocalCapPhase2(nn.Module):
         weighted_patches: Optional[torch.Tensor] = None,
         patch_indices: Optional[torch.Tensor] = None,
         patch_gop_ids: Optional[torch.Tensor] = None,
+        patch_valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz, gops, _ = clip_i_cls.shape
 
-        cls_proj = self.modality_projector(clip_i_cls)
+        cls_proj = self.cls_post_ln(self.modality_projector(clip_i_cls))
         t_embed = self.temporal_embed[:, :gops, :]
         cls = cls_proj + t_embed + self.type_embed[:, 0:1, :]
 
@@ -592,9 +620,9 @@ class FocalCapPhase2(nn.Module):
         if not self.use_action_tokens or action_tokens is None:
             return cls
 
-        act_proj = self.modality_projector(
+        act_proj = self.action_post_ln(self.modality_projector(
             action_tokens.reshape(bsz, gops * self.action_tokens_per_gop, 768)
-        ).reshape(bsz, gops, self.action_tokens_per_gop, 768)
+        )).reshape(bsz, gops, self.action_tokens_per_gop, 768)
         act = act_proj + t_embed.unsqueeze(2) + self.type_embed[:, 1:2, :].unsqueeze(2)
         act = act.view(bsz, gops * self.action_tokens_per_gop, 768)
 
@@ -602,7 +630,7 @@ class FocalCapPhase2(nn.Module):
         if not self.use_spatial_tokens or not self.agdtr_tokens or weighted_patches is None:
             return torch.cat([cls, act], dim=1)
 
-        patch_proj = self.modality_projector(weighted_patches)
+        patch_proj = self.patch_post_ln(self.modality_projector(weighted_patches))
         patch_temporal = torch.gather(
             t_embed.expand(bsz, -1, -1),
             dim=1,
@@ -614,6 +642,8 @@ class FocalCapPhase2(nn.Module):
             index=patch_indices.unsqueeze(-1).expand(-1, -1, 768),
         )
         patch = patch_proj + patch_temporal + self.type_embed[:, 2:3, :] + patch_spatial
+        if patch_valid_mask is not None:
+            patch = patch * patch_valid_mask.unsqueeze(-1).to(dtype=patch.dtype)
 
         return torch.cat([cls, act, patch], dim=1)
 
@@ -658,7 +688,7 @@ class FocalCapPhase2(nn.Module):
         zero_diag = torch.tensor(0.0, device=clip_i_cls.device)
         action = None
         routed = None
-        action_norm = budget_mean = budget_std = patch_diversity = zero_diag
+        action_norm = budget_mean = budget_std = patch_diversity = patch_valid_ratio = zero_diag
         gate_mean = zero_diag
 
         if self.use_action_tokens:
@@ -685,6 +715,8 @@ class FocalCapPhase2(nn.Module):
                 valid_gops = valid_gop_mask.float().sum(dim=1).clamp_min(1.0)
                 budget_mean = (budgets_f.sum(dim=1) / valid_gops).mean()
                 budget_std = budgets_f.std(dim=1, unbiased=False).mean()
+                if "patch_valid_mask" in routed:
+                    patch_valid_ratio = routed["patch_valid_mask"].float().mean()
                 patch_indices_t = routed["patch_indices"]
                 patch_diversity = torch.tensor(0.0, device=clip_i_cls.device)
                 for b in range(bsz):
@@ -699,6 +731,7 @@ class FocalCapPhase2(nn.Module):
             weighted_patches=routed["weighted_patches"] if routed is not None else None,
             patch_indices=routed["patch_indices"] if routed is not None else None,
             patch_gop_ids=routed["patch_gop_ids"] if routed is not None else None,
+            patch_valid_mask=routed["patch_valid_mask"] if routed is not None else None,
         )
 
         # Post-projection magnitude probe — tells you whether GPT-2 even SEES
@@ -795,6 +828,10 @@ class FocalCapPhase2(nn.Module):
         inputs_embeds = torch.cat([visual, vis_end, text_embeds], dim=1)
 
         vis_mask = torch.ones((bsz, visual.shape[1] + 1), dtype=attention_mask.dtype, device=attention_mask.device)
+        if self.use_action_tokens and self.use_spatial_tokens and routed is not None and "patch_valid_mask" in routed:
+            patch_start = gops + gops * self.action_tokens_per_gop
+            patch_end = patch_start + routed["patch_valid_mask"].shape[1]
+            vis_mask[:, patch_start:patch_end] = routed["patch_valid_mask"].to(dtype=vis_mask.dtype)
         text_mask = torch.cat([torch.ones((bsz, 1), dtype=attention_mask.dtype, device=attention_mask.device), attention_mask], dim=1)
         full_mask = torch.cat([vis_mask, text_mask], dim=1)
 
@@ -858,6 +895,7 @@ class FocalCapPhase2(nn.Module):
             "budget_mean": budget_mean,
             "budget_std": budget_std,
             "patch_diversity": patch_diversity,
+            "patch_valid_ratio": patch_valid_ratio,
             "cls_norm_post": cls_norm_post,
             "act_norm_post": act_norm_post,
             "patch_norm_post": patch_norm_post,
@@ -931,6 +969,7 @@ class FocalCapPhase2(nn.Module):
             weighted_patches=routed["weighted_patches"] if routed is not None else None,
             patch_indices=routed["patch_indices"] if routed is not None else None,
             patch_gop_ids=routed["patch_gop_ids"] if routed is not None else None,
+            patch_valid_mask=routed["patch_valid_mask"] if routed is not None else None,
         )
 
         vis_end = self.vis_end.expand(bsz, -1, -1)
@@ -942,6 +981,10 @@ class FocalCapPhase2(nn.Module):
 
         prefix = torch.cat([visual, vis_end, bos_emb], dim=1)
         prefix_mask = torch.ones((bsz, prefix.shape[1]), dtype=torch.long, device=clip_i_cls.device)
+        if self.use_action_tokens and self.use_spatial_tokens and routed is not None and "patch_valid_mask" in routed:
+            patch_start = gops + gops * self.action_tokens_per_gop
+            patch_end = patch_start + routed["patch_valid_mask"].shape[1]
+            prefix_mask[:, patch_start:patch_end] = routed["patch_valid_mask"].to(dtype=prefix_mask.dtype)
 
         return self.gpt2.generate(
             inputs_embeds=prefix,

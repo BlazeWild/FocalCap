@@ -90,6 +90,22 @@ def train(
             len(missing),
             len(unexpected),
         )
+        # Important: clear Trainer-side checkpoint path state set by the failed
+        # resume attempt. Otherwise Lightning may try to restore again even when
+        # we pass ckpt_path=None on this second fit call.
+        try:
+            trainer.ckpt_path = None
+        except Exception:
+            pass
+        if hasattr(trainer, "_checkpoint_connector"):
+            try:
+                trainer._checkpoint_connector._ckpt_path = None
+            except Exception:
+                pass
+            try:
+                trainer._checkpoint_connector._user_managed = False
+            except Exception:
+                pass
         trainer.fit(
             model=model,
             train_dataloaders=train_dataloader,

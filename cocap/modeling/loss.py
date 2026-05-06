@@ -53,6 +53,7 @@ class Phase2CaptionLoss(LossBase):
             "phase2/budget_std": output.get("budget_std", zero).detach(),
             "phase2/action_norm": output.get("action_norm", zero).detach(),
             "phase2/patch_diversity": output.get("patch_diversity", zero).detach(),
+            "phase2/patch_valid_ratio": output.get("patch_valid_ratio", zero).detach(),
             # Per-block visual-token magnitudes after Modality Projector. If
             # cls_norm ≫ patch_norm, GPT-2 sees mostly CLS.
             "phase2/cls_norm_post": output.get("cls_norm_post", zero).detach(),

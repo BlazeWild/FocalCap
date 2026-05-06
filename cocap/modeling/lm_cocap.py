@@ -41,6 +41,8 @@ class CoCapLM(pl.LightningModule):
         weight_decay: float = 0.05,
         warmup_ratio: float = 0.05,
         min_lr_ratio: float = 0.10,
+        tune_motion_encoder: bool = False,
+        motion_lr_scale: float = 0.10,
         max_caption_len_train: int = 50,
         max_new_tokens_eval: int = 60,
     ):
@@ -55,6 +57,8 @@ class CoCapLM(pl.LightningModule):
         self.weight_decay = float(weight_decay)
         self.warmup_ratio = float(warmup_ratio)
         self.min_lr_ratio = float(min_lr_ratio)
+        self.tune_motion_encoder = bool(tune_motion_encoder)
+        self.motion_lr_scale = float(motion_lr_scale)
 
         self.max_caption_len_train = int(max_caption_len_train)
         self.max_new_tokens_eval = int(max_new_tokens_eval)
@@ -68,31 +72,55 @@ class CoCapLM(pl.LightningModule):
         self._best_val_cider = None
 
     def on_fit_start(self) -> None:
+        loaded_motion = False
         if self.init_motion_ckpt and os.path.isfile(self.init_motion_ckpt):
             self._load_motion_ckpt(self.init_motion_ckpt)
             logger.info("Initialized motion encoder from %s", self.init_motion_ckpt)
-            return
+            loaded_motion = True
 
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        candidates = [
-            os.path.join(project_root, "logs", "vatex_pretrain", "motion_encoder_best.pt"),
-            os.path.join(project_root, "logs", "vatex_captioning", "phase1", "checkpoints", "modules", "motion_encoder_best.pt"),
-            os.path.join(
-                os.path.dirname(project_root),
-                "Distilled-Motion-MAE",
-                "logs",
-                "vatex_captioning",
-                "phase1",
-                "checkpoints",
-                "modules",
-                "motion_encoder_best.pt",
-            ),
-        ]
-        for default_p in candidates:
-            if os.path.isfile(default_p):
-                self._load_motion_ckpt(default_p)
-                logger.info("Auto-resolved init_motion_ckpt=%s", default_p)
-                return
+        if not loaded_motion:
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            candidates = [
+                os.path.join(project_root, "logs", "vatex_pretrain", "motion_encoder_best.pt"),
+                os.path.join(project_root, "logs", "vatex_captioning", "phase1", "checkpoints", "modules", "motion_encoder_best.pt"),
+                os.path.join(
+                    os.path.dirname(project_root),
+                    "Distilled-Motion-MAE",
+                    "logs",
+                    "vatex_captioning",
+                    "phase1",
+                    "checkpoints",
+                    "modules",
+                    "motion_encoder_best.pt",
+                ),
+            ]
+            for default_p in candidates:
+                if os.path.isfile(default_p):
+                    self._load_motion_ckpt(default_p)
+                    logger.info("Auto-resolved init_motion_ckpt=%s", default_p)
+                    loaded_motion = True
+                    break
+
+        if self.tune_motion_encoder:
+            self._enable_motion_finetune()
+
+    def _enable_motion_finetune(self) -> None:
+        """Optionally unfreeze motion/residual students for low-LR adaptation."""
+        n_enabled = 0
+        for p in self.model.motion_encoder.student.parameters():
+            if not p.requires_grad:
+                p.requires_grad = True
+                n_enabled += 1
+        if getattr(self.model.motion_encoder, "residual_student", None) is not None:
+            for p in self.model.motion_encoder.residual_student.parameters():
+                if not p.requires_grad:
+                    p.requires_grad = True
+                    n_enabled += 1
+        logger.info(
+            "Motion encoder finetune enabled: params_unfrozen=%d, motion_lr_scale=%.4f",
+            n_enabled,
+            self.motion_lr_scale,
+        )
 
     def _load_motion_ckpt(self, ckpt_path: str) -> None:
         raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -143,6 +171,7 @@ class CoCapLM(pl.LightningModule):
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
         scratch_decay, scratch_no_decay = [], []
+        motion_decay, motion_no_decay = [], []
         lora_params = []
 
         for name, p in self.model.named_parameters():
@@ -150,6 +179,20 @@ class CoCapLM(pl.LightningModule):
                 continue
             if "lora_" in name:
                 lora_params.append(p)
+                continue
+            if name.startswith("motion_encoder."):
+                is_no_decay = (
+                    p.ndim == 1
+                    or name.endswith(".bias")
+                    or "LayerNorm" in name
+                    or "layernorm" in name.lower()
+                    or "ln_" in name
+                    or "norm" in name.lower()
+                )
+                if is_no_decay:
+                    motion_no_decay.append(p)
+                else:
+                    motion_decay.append(p)
                 continue
 
             is_no_decay = (
@@ -170,6 +213,22 @@ class CoCapLM(pl.LightningModule):
             param_groups.append({"params": scratch_decay, "lr": self.lr_scratch, "weight_decay": self.weight_decay})
         if scratch_no_decay:
             param_groups.append({"params": scratch_no_decay, "lr": self.lr_scratch, "weight_decay": 0.0})
+        if motion_decay:
+            param_groups.append(
+                {
+                    "params": motion_decay,
+                    "lr": self.lr_scratch * self.motion_lr_scale,
+                    "weight_decay": self.weight_decay,
+                }
+            )
+        if motion_no_decay:
+            param_groups.append(
+                {
+                    "params": motion_no_decay,
+                    "lr": self.lr_scratch * self.motion_lr_scale,
+                    "weight_decay": 0.0,
+                }
+            )
         if lora_params:
             param_groups.append({"params": lora_params, "lr": self.lr_lora, "weight_decay": 0.0})
 
@@ -246,6 +305,7 @@ class CoCapLM(pl.LightningModule):
             "phase2/gate_mean",
             "phase2/budget_std",
             "phase2/patch_diversity",
+            "phase2/patch_valid_ratio",
             "phase2/attn_patch_mass",
         }
         comp = getattr(self.loss, "latest_loss_components", {})

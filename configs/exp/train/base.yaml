@@ -35,6 +35,9 @@ model:
   weight_decay: 0.05
   warmup_ratio: 0.05
   min_lr_ratio: 0.10
+  # Optional: unfreeze phase-1 motion/residual students with a lower LR.
+  tune_motion_encoder: false
+  motion_lr_scale: 0.10
   max_caption_len_train: 50
   max_new_tokens_eval: 60
 
@@ -50,23 +53,24 @@ model:
     use_action_tokens: true
     use_spatial_tokens: true
     # Number of action tokens per GOP (8 GOPs => total action tokens = 8 * value).
-    action_tokens_per_gop: 2
-    # Action token export: learned pooling beats fixed index subsampling.
+    # 4/GOP keeps temporal detail while avoiding heavy redundancy from 8/GOP.
+    action_tokens_per_gop: 4
+    # Action token export: learned pooling avoids brittle fixed-index subsampling.
     action_use_learned_pooling: true
     # Let residual cues influence exported motion/action tokens.
     action_fuse_residual_into_motion: true
-    # Router query: false = action-only (prevents CLS shortcut dominance).
+    # Action-only router query prevents CLS shortcut from dominating patch picks.
     router_use_cls_query: false
-    # Softer anti-duplicate penalty lets useful repeated object focus survive.
-    router_duplicate_penalty: 1.25
-    router_penalty_decay: 0.90
+    # Keep anti-duplication soft; very large values force diversity over relevance.
+    router_duplicate_penalty: 0.75
+    router_penalty_decay: 0.95
     # Legacy one-block-dropout probability. Kept at 0 because we now use the
     # per-block schedule below to bias CLS suppression.
     block_dropout_p: 0.00
     # Per-block dropout schedule (applied independently each train step):
     # stronger CLS suppression so GPT-2 cannot overfit the shortcut.
     block_dropout_cls_p: 0.10
-    block_dropout_action_p: 0.00
+    block_dropout_action_p: 0.05
     block_dropout_patch_p: 0.02
     # Attribution probe cadence (for logging diagnostics).
     attn_probe_every: 200
@@ -130,7 +134,7 @@ trainer:
 train_dataloader:
   dataset:
     split: "train"
-  num_workers: 16
+  num_workers: 20
   batch_size: 4
   prefetch_factor: 3
   persistent_workers: false
@@ -141,7 +145,7 @@ train_dataloader:
 val_dataloader:
   dataset:
     split: "val"
-  num_workers: 8
+  num_workers: 16
   batch_size: 4
   prefetch_factor: 3
   persistent_workers: false
