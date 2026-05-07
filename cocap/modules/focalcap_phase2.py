@@ -192,7 +192,9 @@ class BudgetAllocator(nn.Module):
         base = 4 * valid.long()
         dynamic_total = (64 - base.sum(dim=1)).clamp(min=0)
 
-        masked_scores = scores.masked_fill(~valid, -1e9)
+        # FP16-safe masking: -1e9 overflows half precision under autocast.
+        neg_fill = torch.finfo(scores.dtype).min
+        masked_scores = scores.masked_fill(~valid, neg_fill)
         probs = F.softmax(masked_scores, dim=1)
         probs = probs * valid.float()
         probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-6)
@@ -201,7 +203,7 @@ class BudgetAllocator(nn.Module):
         dynamic = dynamic * valid.long()
 
         diff = dynamic_total - dynamic.sum(dim=1)
-        valid_scores = dynamic.float().masked_fill(~valid, -1e9)
+        valid_scores = dynamic.float().masked_fill(~valid, torch.finfo(torch.float32).min)
         argmax_idx = valid_scores.argmax(dim=1)
         for b in range(bsz):
             if valid_count[b] > 0 and int(diff[b].item()) != 0:

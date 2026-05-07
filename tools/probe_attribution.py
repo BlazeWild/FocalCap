@@ -79,9 +79,39 @@ def load_phase2_state_into_model(model: torch.nn.Module, lightning_ckpt_path: st
         print("  first missing:", miss[:5])
 
 
+def load_submodule_from_prefixed_state(
+    module: torch.nn.Module,
+    full_state: dict,
+    prefix: str,
+    label: str,
+) -> None:
+    """Load `module` from keys like '<prefix>.*' with shape-safe filtering."""
+    sub_sd = {k[len(prefix):]: v for k, v in full_state.items() if k.startswith(prefix)}
+    model_sd = module.state_dict()
+    filtered_sd = {}
+    skipped_shape = []
+    for k, v in sub_sd.items():
+        if k in model_sd and hasattr(v, "shape") and hasattr(model_sd[k], "shape"):
+            if tuple(v.shape) != tuple(model_sd[k].shape):
+                skipped_shape.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+                continue
+        filtered_sd[k] = v
+
+    miss, unexp = module.load_state_dict(filtered_sd, strict=False)
+    print(f"loaded {label}: missing={len(miss)} unexpected={len(unexp)} filtered={len(filtered_sd)}")
+    if skipped_shape:
+        print(f"  {label} skipped shape-mismatch keys: {len(skipped_shape)}")
+        for k, src_sh, dst_sh in skipped_shape[:5]:
+            print(f"    {k}: ckpt{src_sh} != model{dst_sh}")
+    if miss:
+        print(f"  {label} first missing:", miss[:5])
+    if unexp:
+        print(f"  {label} first unexpected:", unexp[:5])
+
+
 def parse_args():
     base = Path(__file__).resolve().parent.parent
-    default_ckpt = base / "logs" / "vatex_captioning" / "full_subset_fixes_v10" / "checkpoints" / "best" / "last.ckpt"
+    default_ckpt = base / "logs" / "vatex_captioning" / "full_alltokens_v2" / "checkpoints" / "best" / "last.ckpt"
     p = argparse.ArgumentParser(description="Probe CLS/Action/Patch attribution on VATEX val")
     p.add_argument("--ckpt", type=str, default=str(default_ckpt), help="Phase-2 checkpoint path")
     p.add_argument("--n_batches", type=int, default=8, help="Number of val batches to probe")
@@ -115,8 +145,9 @@ def main():
     me = MotionTransformer(embed_dim=384, num_layers=4, num_residual_queries=4, use_residual_stream=True)
     raw = torch.load(motion_ckpt, map_location="cpu", weights_only=False)
     sd = raw.get("state_dict", raw)
-    me.student.load_state_dict({k[len("student."):]: v for k, v in sd.items() if k.startswith("student.")}, strict=True)
-    me.residual_student.load_state_dict({k[len("residual_student."):]: v for k, v in sd.items() if k.startswith("residual_student.")}, strict=True)
+    load_submodule_from_prefixed_state(me.student, sd, "student.", label="motion student")
+    if me.residual_student is not None:
+        load_submodule_from_prefixed_state(me.residual_student, sd, "residual_student.", label="residual student")
 
     model = FocalCapPhase2(
         gpt2_model_path=gpt2_path,

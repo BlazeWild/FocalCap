@@ -129,6 +129,14 @@ class MotionStudent(nn.Module):
         self.res_to_summary = nn.Linear(embed_dim, embed_dim)
         self.res_gate = nn.Parameter(torch.tensor(0.0))
 
+        # Post-attention iframe_cls SCAFFOLD path. iframe_cls is NOT placed in the
+        # summary KV (it dominated softmax at ~76% mass when it was). Instead it
+        # is added as a gated post-attention scaffold so the head has a non-zero
+        # starting direction in CLIP space at step 0. Init at -1.5 → sigmoid≈0.18
+        # (18% scaffold strength). Must exist for state-dict compatibility with
+        # the Distilled-Motion-MAE phase-1 checkpoint.
+        self.iframe_summary_gate = nn.Parameter(torch.tensor(-1.5))
+
         # Zero-init the OUTPUT projections of FFN and residual side-path so all newly-added
         # branches behave as identity / no-op at step 0. Without this, randomly-initialized
         # branches inject noise into the summary vector and slow epoch-0 cos descent (the
@@ -211,21 +219,15 @@ class MotionStudent(nn.Module):
         motion_tokens = self.final_ln(q)
 
         # --- E. Dedicated Summary via 2 Cross-Attention + FFN Blocks ---
-        # KV is motion + residual + iframe_cls (1 scene-context token). Full iframe spatial
-        # (196 patches) was too dominant and caused the cos plateau via shortcut; pure
-        # motion+residual leaves the head with no scene context. CLS-only is the middle
-        # ground: enough to disambiguate scenes (8% of KV), too small to shortcut.
+        # KV is motion + residual ONLY. iframe_cls is NOT placed in KV — at high
+        # init norm it dominates the softmax (~76% mass) and starves the motion
+        # encoder of gradient. iframe_cls instead enters via a post-attention
+        # gated scaffold (see end of this method) — matches the trained
+        # Distilled-Motion-MAE phase-1 checkpoint behavior.
         q = self.summary_query.expand(BG, -1, -1).contiguous()    # [BG, 1, embed_dim]
         kv_parts = [self.summary_ln_kv(motion_tokens)]            # [BG, 8, embed_dim]
         if residual_tokens is not None:
             kv_parts.append(self.summary_ln_kv(residual_tokens))  # [BG, R, embed_dim]
-        if iframe_cls is not None:
-            # CLIP CLS arrives in CLIP's native dtype (often fp16 under bf16-mixed); cast
-            # to the student's dtype so the Linear projection matches.
-            iframe_cls_in = iframe_cls.to(dtype=self.iframe_cls_to_student.weight.dtype)
-            iframe_cls_kv = self.iframe_cls_ln(self.iframe_cls_to_student(iframe_cls_in)).unsqueeze(1)
-            iframe_cls_kv = iframe_cls_kv.to(dtype=kv_parts[0].dtype)
-            kv_parts.append(iframe_cls_kv)                        # [BG, 1, embed_dim]
         kv = torch.cat(kv_parts, dim=1)
         attn1, _ = self.summary_attn1(self.summary_ln_q1(q), kv, kv)
         q = q + attn1
@@ -236,11 +238,16 @@ class MotionStudent(nn.Module):
         summary = self.summary_ln_out(q.squeeze(1))               # [BG, embed_dim]
 
         # Gated residual side-channel into summary (independent of attention softmax).
-        # Even if summary_attn ignores residual KV, this routes residual_pooled into
-        # the final vector so the residual encoder always influences L_cos / L_mse.
         if residual_tokens is not None:
             residual_pooled = residual_tokens.mean(dim=1)         # [BG, embed_dim]
             summary = summary + torch.sigmoid(self.res_gate) * self.res_to_summary(residual_pooled)
+
+        # Gated iframe_cls post-attention scaffold (CLIP-space starting direction).
+        if iframe_cls is not None:
+            iframe_cls_in = iframe_cls.to(dtype=self.iframe_cls_to_student.weight.dtype)
+            iframe_proj = self.iframe_cls_ln(self.iframe_cls_to_student(iframe_cls_in))
+            iframe_proj = iframe_proj.to(dtype=summary.dtype)
+            summary = summary + torch.sigmoid(self.iframe_summary_gate) * iframe_proj
 
         return motion_tokens, summary
 

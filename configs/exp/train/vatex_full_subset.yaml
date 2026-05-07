@@ -38,9 +38,9 @@ model:
   # bug fixed (motion init now in setup() before configure_optimizers), this
   # flag actually has effect — gradient updates the motion encoder away from
   # its phase-1 cos-sim 0.3 endpoint toward features useful for captioning.
-  # 0.05 = ~5e-6 effective LR, conservative to avoid drift on weak features.
+  # 0.10 = ~1e-5 effective LR, still conservative but adapts faster.
   tune_motion_encoder: true
-  motion_lr_scale: 0.05
+  motion_lr_scale: 0.10
 
   cocap_model:
     use_action_tokens: true
@@ -50,25 +50,26 @@ model:
     # single repeated vector (probe showed within-video spread = 1.34).
     action_tokens_per_gop: 8
     action_use_learned_pooling: true
-    action_fuse_residual_into_motion: true
-    router_use_cls_query: false
+    # v11 fix: disable residual->motion fusion to reduce token duplication
+    # across the 8 exported action slots (probe showed action pairwise cos ~0.999).
+    action_fuse_residual_into_motion: false
+    # Let router query include CLS context when action tokens are still weak.
+    router_use_cls_query: true
     router_duplicate_penalty: 0.75
     router_penalty_decay: 0.95
     # Match the historical baseline so you isolate the architectural delta.
     lora_r: 16
     lora_alpha: 32
     lora_target_modules: ["c_attn", "c_proj"]
-    # v10: regularizers OFF. Patch dropout (v8/v9) was a band-aid for a deeper
-    # cause — collapsed motion tokens. With seq_embed boosted to 0.3 in
-    # ActionEncoder, the queries should now be inherently distinct, so streams
-    # carry real per-slot info and balanced attention emerges naturally
-    # (no need to force balance via dropout).
+    # v11 fix: re-enable anti-collapse regularizers.
+    # Your probe shows strong CLS dominance (93%) and almost-zero patch usage (1%).
     block_dropout_p: 0.0
-    block_dropout_cls_p: 0.0
-    block_dropout_action_p: 0.0
-    block_dropout_patch_p: 0.0
+    block_dropout_cls_p: 0.10
+    block_dropout_action_p: 0.05
+    block_dropout_patch_p: 0.02
     attn_probe_every: 100
-    attn_aux_every: 0
-    attn_aux_target_share: 0.15
-    attn_aux_weight: 1.0
-    regularizer_warmup_steps: 0
+    attn_aux_every: 50
+    attn_aux_target_share: 0.18
+    attn_aux_weight: 1.5
+    # Delay regularizers until base caption policy stabilizes.
+    regularizer_warmup_steps: 900
