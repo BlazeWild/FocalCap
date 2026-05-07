@@ -72,7 +72,16 @@ class ActionEncoder(nn.Module):
         self.residual_proj = nn.Linear(384, 768)
         self.proj_ln = nn.LayerNorm(768)
 
-        self.seq_embed = nn.Parameter(torch.randn(1, 12, 768) * 0.02)
+        # seq_embed magnitude bumped from 0.02 -> 0.3. The 8 motion tokens
+        # arriving from MotionStudent are NOT directly supervised in phase-1
+        # (only the summary head was, which is discarded in phase-2). So they
+        # collapse to nearly-parallel vectors (action_pair_cos = 0.997 in v9).
+        # A strong positional embedding gives each of the 12 query slots a
+        # distinct identity even when the underlying motion content is flat,
+        # forcing cross-attention to produce different outputs per slot.
+        # Norm goes from ~0.55 to ~8.3 (roughly 30% of the 28-norm tokens) —
+        # strong differentiation without overwhelming the motion content.
+        self.seq_embed = nn.Parameter(torch.randn(1, 12, 768) * 0.3)
         self.mod_motion = nn.Parameter(torch.randn(1, 1, 768) * 0.02)
         self.mod_residual = nn.Parameter(torch.randn(1, 1, 768) * 0.02)
 
@@ -368,15 +377,29 @@ class PatchRouter(nn.Module):
 
 
 class ModalityProjector(nn.Module):
-    def __init__(self):
+    def __init__(self, zero_init_output: bool = False):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(768, 4096),
             nn.GELU(),
             nn.Linear(4096, 768),
         )
+        # Residual zero-init mode: at step 0, output = input (variance preserved).
+        # The MLP weights start at zero so it adds nothing initially, but gradient
+        # opens it as the model learns useful corrections. Without the residual
+        # connection, plain zero-init caused the projector to collapse to a
+        # near-constant function (input variance 4.27 -> output variance 1.09)
+        # because the loss-minimizing solution is "emit one useful vector for any
+        # input." That suppressed action token diversity AND starved the motion
+        # encoder of useful upstream gradient.
+        self.residual_mode = bool(zero_init_output)
+        if zero_init_output:
+            nn.init.zeros_(self.net[2].weight)
+            nn.init.zeros_(self.net[2].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.residual_mode:
+            return x + self.net(x)
         return self.net(x)
 
 
@@ -407,6 +430,10 @@ class FocalCapPhase2(nn.Module):
         router_use_cls_query: bool = False,
         router_duplicate_penalty: float = 1.25,
         router_penalty_decay: float = 0.90,
+        lora_r: int = 32,
+        lora_alpha: int = 64,
+        lora_dropout: float = 0.1,
+        lora_target_modules: Optional[List[str]] = None,
     ):
         super().__init__()
 
@@ -479,7 +506,16 @@ class FocalCapPhase2(nn.Module):
             duplicate_penalty=self.router_duplicate_penalty,
             penalty_decay=self.router_penalty_decay,
         )
-        self.modality_projector = ModalityProjector()
+        # Per-stream projectors so each modality can specialize its 768→GPT2
+        # mapping. A shared MLP collapses CLS/Action/Patch into a single
+        # distribution and CLS dominates because its features are closest to
+        # the projector's learned mode.
+        # Action and patch projectors are zero-init at the output: at step 0
+        # they emit zero tokens, so the prefix is effectively CLS-only.
+        # Gradient gradually opens them as the model learns to use the streams.
+        self.cls_proj = ModalityProjector()
+        self.act_proj = ModalityProjector(zero_init_output=True)
+        self.patch_proj = ModalityProjector(zero_init_output=True)
         # Per-modality post-projector normalization keeps CLS/Action/Patch
         # token scales comparable before concatenation into GPT-2 prefix.
         self.cls_post_ln = nn.LayerNorm(768)
@@ -510,11 +546,12 @@ class FocalCapPhase2(nn.Module):
 
         self.using_lora = False
         if use_lora and _HAS_PEFT:
+            target_modules = list(lora_target_modules) if lora_target_modules else ["c_attn", "c_proj", "c_fc"]
             lora_cfg = LoraConfig(
-                r=16,
-                lora_alpha=32,
-                target_modules=["c_attn", "c_proj"],
-                lora_dropout=0.1,
+                r=int(lora_r),
+                lora_alpha=int(lora_alpha),
+                target_modules=target_modules,
+                lora_dropout=float(lora_dropout),
                 bias="none",
                 task_type="CAUSAL_LM",
                 fan_in_fan_out=True,
@@ -612,25 +649,25 @@ class FocalCapPhase2(nn.Module):
     ) -> torch.Tensor:
         bsz, gops, _ = clip_i_cls.shape
 
-        cls_proj = self.cls_post_ln(self.modality_projector(clip_i_cls))
+        cls_projected = self.cls_post_ln(self.cls_proj(clip_i_cls))
         t_embed = self.temporal_embed[:, :gops, :]
-        cls = cls_proj + t_embed + self.type_embed[:, 0:1, :]
+        cls = cls_projected + t_embed + self.type_embed[:, 0:1, :]
 
         # CLS-only mode: no action or patch tokens
         if not self.use_action_tokens or action_tokens is None:
             return cls
 
-        act_proj = self.action_post_ln(self.modality_projector(
+        act_projected = self.action_post_ln(self.act_proj(
             action_tokens.reshape(bsz, gops * self.action_tokens_per_gop, 768)
         )).reshape(bsz, gops, self.action_tokens_per_gop, 768)
-        act = act_proj + t_embed.unsqueeze(2) + self.type_embed[:, 1:2, :].unsqueeze(2)
+        act = act_projected + t_embed.unsqueeze(2) + self.type_embed[:, 1:2, :].unsqueeze(2)
         act = act.view(bsz, gops * self.action_tokens_per_gop, 768)
 
         # CLS + Action mode: no patch tokens
         if not self.use_spatial_tokens or not self.agdtr_tokens or weighted_patches is None:
             return torch.cat([cls, act], dim=1)
 
-        patch_proj = self.patch_post_ln(self.modality_projector(weighted_patches))
+        patch_projected = self.patch_post_ln(self.patch_proj(weighted_patches))
         patch_temporal = torch.gather(
             t_embed.expand(bsz, -1, -1),
             dim=1,
@@ -641,7 +678,7 @@ class FocalCapPhase2(nn.Module):
             dim=1,
             index=patch_indices.unsqueeze(-1).expand(-1, -1, 768),
         )
-        patch = patch_proj + patch_temporal + self.type_embed[:, 2:3, :] + patch_spatial
+        patch = patch_projected + patch_temporal + self.type_embed[:, 2:3, :] + patch_spatial
         if patch_valid_mask is not None:
             patch = patch * patch_valid_mask.unsqueeze(-1).to(dtype=patch.dtype)
 

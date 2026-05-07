@@ -31,6 +31,26 @@ def train(
     if ckpt_path is None:
         ckpt_path = os.environ.get("CKPT_PATH")
 
+    # Guard: if the run dir already has Lightning checkpoints and no ckpt_path /
+    # weights_only_ckpt was supplied, the user is about to silently restart from
+    # scratch into an existing experiment directory (the polish-run footgun).
+    run_dir = getattr(trainer, "default_root_dir", "") or ""
+    if run_dir and not ckpt_path and not weights_only_ckpt:
+        latest_dir = os.path.join(run_dir, "checkpoints", "latest")
+        best_dir = os.path.join(run_dir, "checkpoints", "best")
+        prior = []
+        for d in (latest_dir, best_dir):
+            if os.path.isdir(d):
+                prior.extend(p for p in os.listdir(d) if p.endswith(".ckpt"))
+        if prior:
+            raise RuntimeError(
+                f"Run dir already contains checkpoints ({len(prior)} found under "
+                f"{run_dir}/checkpoints/) but no ckpt_path was provided. Refusing "
+                f"to silently restart from scratch and overwrite them. Either pass "
+                f"ckpt_path=<…/last.ckpt> to resume, weights_only_ckpt=<…> to warm "
+                f"start, or change trainer.default_root_dir to a fresh path."
+            )
+
     if weights_only_ckpt:
         raw = torch.load(weights_only_ckpt, map_location="cpu", weights_only=False)
         state = raw.get("state_dict", raw)
@@ -42,6 +62,16 @@ def train(
             len(unexpected),
         )
         ckpt_path = None
+
+    # Trigger LightningModule.setup() now so motion checkpoint load + the
+    # tune_motion_encoder flip happen BEFORE the summary print and BEFORE
+    # configure_optimizers fires inside trainer.fit(). Without this the
+    # summary shows pre-setup state (motion frozen) even when the flag is on.
+    if hasattr(model, "setup"):
+        try:
+            model.setup("fit")
+        except Exception as exc:
+            logger.warning("model.setup('fit') failed: %s", exc)
 
     try:
         from torchinfo import summary

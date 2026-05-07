@@ -71,7 +71,18 @@ class CoCapLM(pl.LightningModule):
         self.batch_res = None
         self._best_val_cider = None
 
-    def on_fit_start(self) -> None:
+    def setup(self, stage: str) -> None:
+        """Lightning calls setup() BEFORE configure_optimizers(), so motion
+        checkpoint load + tune_motion_encoder flip must happen here. Doing it
+        in on_fit_start() (which fires AFTER configure_optimizers) silently
+        excluded motion params from the optimizer — they had requires_grad=True
+        but no update step ever ran.
+        """
+        if stage != "fit":
+            return
+        if getattr(self, "_motion_setup_done", False):
+            return
+
         loaded_motion = False
         if self.init_motion_ckpt and os.path.isfile(self.init_motion_ckpt):
             self._load_motion_ckpt(self.init_motion_ckpt)
@@ -103,6 +114,15 @@ class CoCapLM(pl.LightningModule):
 
         if self.tune_motion_encoder:
             self._enable_motion_finetune()
+
+        self._motion_setup_done = True
+
+    def on_fit_start(self) -> None:
+        # Backstop: if setup() wasn't called for some reason (e.g. resume from
+        # ckpt without re-running setup), do the motion init here. This is
+        # late for tune_motion_encoder (optimizer already built), but safe.
+        if not getattr(self, "_motion_setup_done", False):
+            self.setup("fit")
 
     def _enable_motion_finetune(self) -> None:
         """Optionally unfreeze motion/residual students for low-LR adaptation."""
@@ -156,14 +176,18 @@ class CoCapLM(pl.LightningModule):
             r_miss, r_unexp = self.model.motion_encoder.residual_student.load_state_dict(residual_state, strict=True)
             logger.info("Loaded residual student from %s (missing=%d unexpected=%d)", ckpt_path, len(r_miss), len(r_unexp))
 
-        # Enforce freeze/eval after load.
-        for p in self.model.motion_encoder.student.parameters():
-            p.requires_grad = False
-        self.model.motion_encoder.student.eval()
-        if getattr(self.model.motion_encoder, "residual_student", None) is not None:
-            for p in self.model.motion_encoder.residual_student.parameters():
+        # Enforce freeze/eval after load — UNLESS tune_motion_encoder is on,
+        # in which case setup() will flip requires_grad=True right after this.
+        # Re-freezing unconditionally would undo that and silently exclude
+        # motion params from the optimizer.
+        if not self.tune_motion_encoder:
+            for p in self.model.motion_encoder.student.parameters():
                 p.requires_grad = False
-            self.model.motion_encoder.residual_student.eval()
+            self.model.motion_encoder.student.eval()
+            if getattr(self.model.motion_encoder, "residual_student", None) is not None:
+                for p in self.model.motion_encoder.residual_student.parameters():
+                    p.requires_grad = False
+                self.model.motion_encoder.residual_student.eval()
 
     @property
     def total_steps(self) -> int:

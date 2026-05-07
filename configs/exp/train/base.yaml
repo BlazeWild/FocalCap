@@ -43,6 +43,13 @@ model:
 
   cocap_model:
     use_lora: true
+    # LoRA capacity. r=32/alpha=64 with c_fc included gives GPT-2 enough
+    # adaptation room to actually attend to action+patch streams; r=16 was
+    # too tight when the prefix grew past CLS-only.
+    lora_r: 32
+    lora_alpha: 64
+    lora_dropout: 0.1
+    lora_target_modules: ["c_attn", "c_proj", "c_fc"]
     agdtr_tokens: true
     # ── Block-level ablation flags ──
     # use_action_tokens: false → CLS-only (motion/action/residual skipped entirely)
