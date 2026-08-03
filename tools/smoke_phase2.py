@@ -6,7 +6,7 @@ Verifies:
   - Phase-1 motion_encoder ckpt loads
   - Forward pass produces logits with the expected shape
   - Cross-entropy (with shift) is finite
-  - Gradient flows back to Action Encoder, AGDTR, Modality Projector, embeds, and LoRA
+  - Gradient flows back to Action Encoder, AGDTR, projectors, embeds, and LoRA
 """
 import os
 import sys
@@ -90,7 +90,9 @@ def main():
         "action_encoder": model.action_encoder,
         "budget_allocator": model.budget_allocator,
         "patch_router": model.patch_router,
-        "modality_projector": model.modality_projector,
+        "cls_projector": model.cls_projector,
+        "action_projector": model.action_projector,
+        "patch_projector": model.patch_projector,
     }
     for name, mod in grad_modules.items():
         gnorm = sum((p.grad.detach().pow(2).sum().item() for p in mod.parameters() if p.grad is not None)) ** 0.5

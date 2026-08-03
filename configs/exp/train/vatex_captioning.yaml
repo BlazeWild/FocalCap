@@ -8,4 +8,4 @@ defaults:
   - _self_
 
 trainer:
-  default_root_dir: "./logs/vatex_captioning/phase2_oneshot"
+  default_root_dir: "./logs/sig6k_full"

@@ -15,7 +15,7 @@ class LossBase(nn.Module):
 
 
 class Phase2CaptionLoss(LossBase):
-    """Single CE loss over caption tokens (label smoothing=0.1 by default)."""
+    """Single CE loss over caption tokens."""
 
     def __init__(self, label_smoothing: float = 0.1, ignore_index: int = -100):
         super().__init__()

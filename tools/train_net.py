@@ -62,5 +62,6 @@ if __name__ == "__main__":
 
     zen(train).hydra_main(
         config_path=(Path(__file__).parent.parent / "configs").as_posix(),
+        config_name="exp/train/vatex_captioning",
         version_base=None,
     )

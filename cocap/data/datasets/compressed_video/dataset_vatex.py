@@ -79,27 +79,25 @@ class VATEXCaptioningDataset(data.Dataset):
         # For flattened GOP indexing we need all valid GOPs from a video when decoding mp4.
         self.h265_cfg_all = replace(self.h265_cfg, num_gop=-1)
 
-        if use_preextracted_features is None:
-            # Legacy auto-detect fallback only when flag is not provided.
-            probe_root = self.video_root_pt or self.video_root
-            self.use_pt_features = os.path.isdir(probe_root) and any(
-                name.endswith(".pt") for name in os.listdir(probe_root)
-            )
-        else:
-            self.use_pt_features = bool(use_preextracted_features)
-            # Force fallback to MP4 if the explicit .pt directory doesn't exist
-            probe_root = self.video_root_pt or self.video_root
-            if self.use_pt_features and not (os.path.isdir(probe_root) and any(name.endswith(".pt") for name in os.listdir(probe_root))):
-                print(f"[WARNING] use_preextracted_features={use_preextracted_features} but no .pt files found in {probe_root}. Falling back to MP4 videos.")
-                self.use_pt_features = False
+        probe_root = self.video_root_pt or self.video_root
+        has_pt_features = os.path.isdir(probe_root) and any(
+            name.endswith(".pt") for name in os.listdir(probe_root)
+        )
 
-        # Resolve active source root from the explicit toggle:
-        # - True  => video_root_pt (pre-extracted tensor dicts)
-        # - False => video_root_mp4 (raw compressed mp4)
-        if self.use_pt_features:
-            self.video_root = self.video_root_pt or self.video_root
-        else:
-            self.video_root = self.video_root_mp4 or self.video_root
+        # Strict PT-only mode: never fall back to MP4 decode in this dataset.
+        if use_preextracted_features is not None and not bool(use_preextracted_features):
+            raise RuntimeError(
+                "PT-only dataset mode: `use_preextracted_features` must be true. "
+                "MP4 decode path is disabled to prevent leakage."
+            )
+        if not has_pt_features:
+            raise FileNotFoundError(
+                f"PT-only dataset mode: no .pt features found in `{probe_root}`. "
+                "MP4 fallback is disabled."
+            )
+
+        self.use_pt_features = True
+        self.video_root = probe_root
 
         # Load metadata to identify which videos belong to which split
         metadata_dict = load_json(metadata)
@@ -144,7 +142,7 @@ class VATEXCaptioningDataset(data.Dataset):
         self.tokenizer = GPT2Tokenizer.from_pretrained(offline_gpt2_path, local_files_only=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Compressed-domain reader
+        # Compressed-domain reader (unused in PT-only mode).
         self.video_reader = None if self.use_pt_features else VIDEO_READER_REGISTRY.get(video_reader)
 
         # Keep videos with valid GOPs; each sample returns a full multi-GOP clip.
@@ -285,14 +283,28 @@ class VATEXCaptioningDataset(data.Dataset):
             video = torch.load(self._get_video_path(video_id), map_location="cpu", weights_only=False)
             if "motion_vectors" in video and "motion_vector" not in video:
                 video["motion_vector"] = video["motion_vectors"]
+            # SigLIP2 naming compatibility: map siglip2_* keys to clip_* keys
+            # expected by the phase-2 model.
+            if "clip_i_cls" not in video and "siglip2_i_cls" in video:
+                video["clip_i_cls"] = video["siglip2_i_cls"]
+            if "clip_i_spatial" not in video and "siglip2_i_spatial" in video:
+                video["clip_i_spatial"] = video["siglip2_i_spatial"]
+            if "clip_p_cls" not in video and "siglip2_p_cls" in video:
+                video["clip_p_cls"] = video["siglip2_p_cls"]
+            if "clip_p_spatial" not in video and "siglip2_p_spatial" in video:
+                video["clip_p_spatial"] = video["siglip2_p_spatial"]
             if "clip_i_cls" in video and torch.is_tensor(video["clip_i_cls"]):
-                video["clip_i_cls"] = video["clip_i_cls"].float()
+                video["clip_i_cls"] = video["clip_i_cls"].to(dtype=torch.bfloat16)
+            if "clip_p_cls" in video and torch.is_tensor(video["clip_p_cls"]):
+                video["clip_p_cls"] = video["clip_p_cls"].to(dtype=torch.bfloat16)
             if "clip_i_spatial" in video and torch.is_tensor(video["clip_i_spatial"]):
-                video["clip_i_spatial"] = video["clip_i_spatial"].float()
+                video["clip_i_spatial"] = video["clip_i_spatial"].to(dtype=torch.bfloat16)
             if "clip_p_spatial" in video and torch.is_tensor(video["clip_p_spatial"]):
-                video["clip_p_spatial"] = video["clip_p_spatial"].float()
+                video["clip_p_spatial"] = video["clip_p_spatial"].to(dtype=torch.bfloat16)
             if "motion_vector" in video and torch.is_tensor(video["motion_vector"]):
-                video["motion_vector"] = video["motion_vector"].float()
+                video["motion_vector"] = video["motion_vector"].to(dtype=torch.bfloat16)
+            if "residual" in video and torch.is_tensor(video["residual"]):
+                video["residual"] = video["residual"].to(dtype=torch.bfloat16)
             if "input_mask_mv" not in video and "motion_vector" in video:
                 mv = video["motion_vector"]
                 video["input_mask_mv"] = torch.zeros((mv.shape[0], mv.shape[1]), dtype=torch.long)

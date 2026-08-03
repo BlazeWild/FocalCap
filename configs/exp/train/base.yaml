@@ -28,31 +28,58 @@ hydra:
     disable_existing_loggers: false
 
 model:
-  use_preextracted_features: false
-  init_motion_ckpt: ""
-  lr_scratch: 1.0e-4
+  use_preextracted_features: true
+  init_motion_ckpt: "${hydra:runtime.cwd}/checkpoints/phase1_v2/best-014-0.7220.ckpt"
+  lr_scratch: 2.0e-4
   lr_lora: 2.0e-4
+  # Motion+residual encoder fine-tuning LR = lr_motion_scale * lr_scratch.
+  lr_motion_scale: 0.10
+  # Diagnostic action-prefix run: keep the phase-1 motion/residual towers fixed
+  # so concat-vs-pool effects are not confounded by encoder drift.
+  train_motion_encoder: false
   weight_decay: 0.05
-  warmup_ratio: 0.05
+  # No warmup for now: peak LR from step 0 so epoch-0 actually trains instead
+  # of spending the whole first epoch ramping up (0.05 ≈ 1 full epoch here).
+  warmup_ratio: 0.0
   min_lr_ratio: 0.10
   max_caption_len_train: 50
   max_new_tokens_eval: 60
+  # Optional thermal throttle for local machines (seconds of sleep per step).
+  # Raised for a cooler training profile on thermally constrained laptops.
+  gpu_cooldown_train_step_sec: 0.15
+  gpu_cooldown_val_step_sec: 0.15
 
   cocap_model:
     use_lora: true
-    # 0.0 = disabled. Forces multi-block usage by zeroing one block at random
-    # during training. Confirmed via tools/probe_attribution.py at epoch 5 that
-    # GPT-2 was reading 88% of visual attention from CLS — so this is on at
-    # 0.20 to push it toward Action+Patch.
-    block_dropout_p: 0.20
+    tune_motion_encoder: false
+    cls_only: false
+    # use_agdtr=false: CLS + Action tokens only, no patch routing. Ablation to
+    # test whether action tokens contribute before enabling the full pipeline.
+    use_agdtr: false
+    # fused_cls: action conditions each GOP CLS, and GPT-2 still sees only 8
+    # visual prefix tokens. This avoids the extra-token attention competition
+    # seen in interleaved_action1/region4 while keeping the improved action
+    # encoder active. Override to interleaved_action1/region4 for ablations.
+    action_prefix_mode: "fused_cls"
+    block_dropout_p: 0.0
     # Compute caption→visual attention attribution every N train forwards.
     # 0 disables. 200 ≈ once every ~7s; negligible cost, huge diagnostic value.
     attn_probe_every: 200
     motion_encoder:
       embed_dim: 384
-      num_layers: 4
-      num_residual_queries: 4
-      use_residual_stream: true
+      num_heads: 8
+      num_refiner_layers: 2
+      ffn_mult: 4
+      dropout: 0.1
+      pos_frac: 0.3
+      use_residual_encoder: true
+      residual_in_channels: 3
+      residual_embed_dim: 384
+      residual_num_heads: 8
+      residual_num_refiner_layers: 2
+      residual_ffn_mult: 4
+      residual_dropout: 0.1
+      residual_pos_frac: 0.3
 
   loss:
     _target_: cocap.modeling.loss.Phase2CaptionLoss
@@ -64,10 +91,18 @@ trainer:
   devices: 1
   strategy: "auto"
   max_epochs: 20
-  accumulate_grad_batches: 2
+  # Effective train batch = train_dataloader.batch_size * accumulate_grad_batches * devices
+  # = 4 * 1 * 1 = 4. accumulate=8 gave only ~62 optimizer steps/epoch (499/8),
+  # starving the from-scratch projector + LoRA so epoch-0 CIDEr stayed low.
+  # accumulate=1 → ~499 updates/epoch (~8x), recovering fast early convergence.
+  accumulate_grad_batches: 4
   gradient_clip_val: 1.0
   log_every_n_steps: 10
   num_sanity_val_steps: 0
+  # bf16-mixed keeps fp32 master weights + bf16 autocast compute. bf16-true
+  # (bf16 weights, bf16 optimizer state, no fp32 master) silently rounds away
+  # the small AdamW updates to the from-scratch modality projector + LoRA and
+  # starves convergence. Mixed costs ~0.5GB more here and trains far better.
   precision: "bf16-mixed"
 
   logger:
@@ -101,21 +136,23 @@ trainer:
 train_dataloader:
   dataset:
     split: "train"
-  num_workers: 8
-  batch_size: 4
-  prefetch_factor: 2
-  persistent_workers: true
+  # Low-heat mode: single-process loading to reduce CPU spikes and fan ramps.
+  num_workers: 0uuyuuuyuyyhyu
+  batch_size: 2
+  # Must be null when num_workers=0.
+  prefetch_factor: null
+  persistent_workers: false
   shuffle: true
-  pin_memory: true
+  pin_memory: false
   multiprocessing_context: null
 
 val_dataloader:
   dataset:
     split: "val"
-  num_workers: 4
-  batch_size: 4
-  prefetch_factor: 2
-  persistent_workers: true
+  num_workers: 2
+  batch_size: 2
+  prefetch_factor: null
+  persistent_workers: false
   shuffle: false
-  pin_memory: true
+  pin_memory: false
   multiprocessing_context: null

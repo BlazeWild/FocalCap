@@ -1,9 +1,9 @@
 _target_: "cocap.data.datasets.compressed_video.dataset_vatex.VATEXCaptioningDataset"
 
-video_root_mp4: "${hydra:runtime.cwd}/dataset/vatex/videos_h264_240p"
-video_root_pt: "${hydra:runtime.cwd}/dataset/vatex/video_preextracted_pt"
+video_root_mp4: "/home/blaze/Documents/Windows_Backup/Ashok/_AI/_COMPUTER_VISION/____RESEARCH/Distilled-Motion-MAE/dataset/vatex/videos_h264_240p"
+video_root_pt: "/home/blaze/Documents/Windows_Backup/Ashok/_AI/_COMPUTER_VISION/____RESEARCH/Distilled-Motion-MAE/dataset/vatex/video_preextracted_pt_new"
 video_root: "${.video_root_mp4}"
-metadata: "${hydra:runtime.cwd}/dataset/vatex/VATEX_caption.json"
+metadata: "/home/blaze/Documents/Windows_Backup/Ashok/_AI/_COMPUTER_VISION/____RESEARCH/Distilled-Motion-MAE/dataset/vatex/VATEX_caption.json"
 use_preextracted_features: ${model.use_preextracted_features}
 
 video_reader: "read_frames_compressed_domain"
@@ -18,11 +18,12 @@ unfold_sentences: true
 # 10  = match VATEX's full caption set (10 per video) with 10× train cost.
 # Forced to 1 on val/test inside the dataset regardless of this setting.
 captions_per_video: 1
+max_videos_per_split: 3000
 cv_config:
   num_gop: 8
   num_mv: 29
   num_res: 29
   with_residual: true
   with_bp_rgb: false
-  use_pre_extract: false
+  use_pre_extract: true
   sample: "pad"
