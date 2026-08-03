@@ -35,7 +35,6 @@ python3 tools/train_net.py train_dataloader.dataset.max_videos_per_split=5 val_d
 
 python3 tools/train_net.py "ckpt_path=/home/ashim/runs/vatex_pretrain_full_phase1_cls/checkpoints/latest/latest-epoch003-step8576.ckpt" "trainer.default_root_dir=/home/ashim/runs/vatex_pretrain_full_phase1_cls" 
 
-
 source ~/venvs/distilled-motion-mae/bin/activate
 
 python3 tools/train_net.py "ckpt_path=/home/ashim/runs/vatex_pretrain_full_phase1_cls_res/checkpoints/latest/latest-epoch001-step4288.ckpt" "trainer.default_root_dir=/home/ashim/runs/vatex_pretrain_full_phase1_cls_res"

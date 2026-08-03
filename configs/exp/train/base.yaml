@@ -42,6 +42,9 @@ model:
   # of spending the whole first epoch ramping up (0.05 ≈ 1 full epoch here).
   warmup_ratio: 0.0
   min_lr_ratio: 0.10
+  # Optional: unfreeze phase-1 motion/residual students with a lower LR.
+  tune_motion_encoder: false
+  motion_lr_scale: 0.10
   max_caption_len_train: 50
   max_new_tokens_eval: 60
   # Optional thermal throttle for local machines (seconds of sleep per step).
@@ -65,6 +68,13 @@ model:
     # Compute caption→visual attention attribution every N train forwards.
     # 0 disables. 200 ≈ once every ~7s; negligible cost, huge diagnostic value.
     attn_probe_every: 200
+    # Attention-aux cadence (for optimization signal), target share, and weight.
+    attn_aux_every: 50
+    attn_aux_target_share: 0.18
+    attn_aux_weight: 1.5
+    # Start dropout/attn-aux after ~1 epoch (VATEX: ~2298 steps at bs=4,acc=2).
+    # Helps avoid early generic-caption collapse.
+    regularizer_warmup_steps: 2300
     motion_encoder:
       embed_dim: 384
       num_heads: 8

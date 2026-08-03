@@ -46,6 +46,8 @@ class CoCapLM(pl.LightningModule):
         weight_decay: float = 0.05,
         warmup_ratio: float = 0.05,
         min_lr_ratio: float = 0.10,
+        tune_motion_encoder: bool = False,
+        motion_lr_scale: float = 0.10,
         max_caption_len_train: int = 50,
         max_new_tokens_eval: int = 60,
         gpu_cooldown_train_step_sec: float = 0.0,
@@ -79,6 +81,8 @@ class CoCapLM(pl.LightningModule):
         self.weight_decay = float(weight_decay)
         self.warmup_ratio = float(warmup_ratio)
         self.min_lr_ratio = float(min_lr_ratio)
+        self.tune_motion_encoder = bool(tune_motion_encoder)
+        self.motion_lr_scale = float(motion_lr_scale)
 
         self.max_caption_len_train = int(max_caption_len_train)
         self.max_new_tokens_eval = int(max_new_tokens_eval)
@@ -249,11 +253,23 @@ class CoCapLM(pl.LightningModule):
         ]
         self.print("\n".join(lines))
 
-    def on_fit_start(self) -> None:
+    def setup(self, stage: str) -> None:
+        """Lightning calls setup() BEFORE configure_optimizers(), so motion
+        checkpoint load + tune_motion_encoder flip must happen here. Doing it
+        in on_fit_start() (which fires AFTER configure_optimizers) silently
+        excluded motion params from the optimizer — they had requires_grad=True
+        but no update step ever ran.
+        """
+        if stage != "fit":
+            return
+        if getattr(self, "_motion_setup_done", False):
+            return
+
+        loaded_motion = False
         if self.init_motion_ckpt and os.path.isfile(self.init_motion_ckpt):
             self._load_motion_ckpt(self.init_motion_ckpt)
             logger.info("Initialized motion encoder from %s", self.init_motion_ckpt)
-            return
+            loaded_motion = True
 
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         candidates = [
@@ -384,6 +400,20 @@ class CoCapLM(pl.LightningModule):
             if "lora_" in name:
                 lora_params.append(p)
                 continue
+            if name.startswith("motion_encoder."):
+                is_no_decay = (
+                    p.ndim == 1
+                    or name.endswith(".bias")
+                    or "LayerNorm" in name
+                    or "layernorm" in name.lower()
+                    or "ln_" in name
+                    or "norm" in name.lower()
+                )
+                if is_no_decay:
+                    motion_no_decay.append(p)
+                else:
+                    motion_decay.append(p)
+                continue
 
             is_no_decay = (
                 p.ndim == 1
@@ -496,6 +526,7 @@ class CoCapLM(pl.LightningModule):
             "phase2/gate_mean",
             "phase2/budget_std",
             "phase2/patch_diversity",
+            "phase2/patch_valid_ratio",
             "phase2/attn_patch_mass",
         }
         comp = getattr(self.loss, "latest_loss_components", {})

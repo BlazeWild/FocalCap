@@ -276,8 +276,12 @@ class ActionEncoder(nn.Module):
 
 
 class BudgetAllocator(nn.Module):
-    def __init__(self):
+    def __init__(self, action_tokens_per_gop: int = 8):
         super().__init__()
+        self.action_tokens_per_gop = int(action_tokens_per_gop)
+        if self.action_tokens_per_gop < 1:
+            raise ValueError(f"action_tokens_per_gop must be >=1, got {self.action_tokens_per_gop}")
+
         self.budget_token = nn.Parameter(torch.randn(1, 1, 768) * 0.02)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=768,
@@ -312,7 +316,9 @@ class BudgetAllocator(nn.Module):
         base = 4 * valid.long()
         dynamic_total = (64 - base.sum(dim=1)).clamp(min=0)
 
-        masked_scores = scores.masked_fill(~valid, -1e9)
+        # FP16-safe masking: -1e9 overflows half precision under autocast.
+        neg_fill = torch.finfo(scores.dtype).min
+        masked_scores = scores.masked_fill(~valid, neg_fill)
         probs = F.softmax(masked_scores, dim=1)
         probs = probs * valid.to(dtype=probs.dtype)
         probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-6)
@@ -332,8 +338,20 @@ class BudgetAllocator(nn.Module):
 
 
 class PatchRouter(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        action_tokens_per_gop: int = 8,
+        use_cls_in_query: bool = False,
+        duplicate_penalty: float = 1.25,
+        penalty_decay: float = 0.90,
+    ):
         super().__init__()
+        self.action_tokens_per_gop = int(action_tokens_per_gop)
+        if self.action_tokens_per_gop < 1:
+            raise ValueError(f"action_tokens_per_gop must be >=1, got {self.action_tokens_per_gop}")
+        self.use_cls_in_query = bool(use_cls_in_query)
+        self.duplicate_penalty = float(duplicate_penalty)
+        self.penalty_decay = float(penalty_decay)
         self.scorer = CrossAttentionBlock(d_model=768, nhead=8, dim_feedforward=3072, dropout=0.1)
         self.attn_probe = {}
 
@@ -344,9 +362,9 @@ class PatchRouter(nn.Module):
         gops: torch.Tensor,
         mask: torch.Tensor,
         total: int = 64,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz = toks.shape[0]
-        packed_t, packed_i, packed_g = [], [], []
+        packed_t, packed_i, packed_g, packed_m = [], [], [], []
         for b in range(bsz):
             vb = mask[b]
             t = toks[b][vb]
@@ -357,14 +375,22 @@ class PatchRouter(nn.Module):
                 packed_t.append(t[:total])
                 packed_i.append(i[:total])
                 packed_g.append(g[:total])
+                packed_m.append(torch.ones((total,), device=t.device, dtype=torch.bool))
             else:
                 pad_t = torch.zeros((total - n, toks.shape[-1]), device=t.device, dtype=t.dtype)
                 pad_i = torch.zeros((total - n,), device=i.device, dtype=i.dtype)
                 pad_g = torch.zeros((total - n,), device=g.device, dtype=g.dtype)
+                pad_m = torch.zeros((total - n,), device=t.device, dtype=torch.bool)
                 packed_t.append(torch.cat([t, pad_t], dim=0))
                 packed_i.append(torch.cat([i, pad_i], dim=0))
                 packed_g.append(torch.cat([g, pad_g], dim=0))
-        return torch.stack(packed_t, dim=0), torch.stack(packed_i, dim=0), torch.stack(packed_g, dim=0)
+                packed_m.append(torch.cat([torch.ones((n,), device=t.device, dtype=torch.bool), pad_m], dim=0))
+        return (
+            torch.stack(packed_t, dim=0),
+            torch.stack(packed_i, dim=0),
+            torch.stack(packed_g, dim=0),
+            torch.stack(packed_m, dim=0),
+        )
 
     def forward(
         self,
@@ -380,7 +406,11 @@ class PatchRouter(nn.Module):
         kv = clip_patches.reshape(bsz * gops, npatch, 768)
 
         _, attn_w = self.scorer(q, kv, need_weights=True)
-        raw = attn_w.mean(dim=1).mean(dim=1).reshape(bsz, gops, npatch)
+        # Use max() instead of mean() across action queries so that patches highly 
+        # relevant to *any* specific action token are preserved, rather than being 
+        # diluted by queries that ignore them.
+        raw, _ = attn_w.mean(dim=1).max(dim=1)
+        raw = raw.reshape(bsz, gops, npatch)
 
         # AGDTR internal-attention probe (never affects routing). q row 0 is the
         # CLS query, rows 1..K are the action queries. router_cls_act_agree =
@@ -408,7 +438,9 @@ class PatchRouter(nn.Module):
         gate_chunks: List[torch.Tensor] = []
 
         for t in range(gops):
-            cur_scores = raw[:, t, :] + penalty_mask
+            if t > 0 and self.penalty_decay < 1.0:
+                duplicate_mask = duplicate_mask * self.penalty_decay
+            cur_scores = raw[:, t, :] - duplicate_mask
             kmax = int(gop_budgets[:, t].max().item())
             if kmax <= 0:
                 continue
@@ -423,7 +455,11 @@ class PatchRouter(nn.Module):
                 index=top_idx.unsqueeze(-1).expand(-1, -1, 768),
             )
             raw_t = torch.gather(raw[:, t, :], dim=1, index=top_idx)
-            gates_t = torch.sigmoid(raw_t)
+            # Softmax-normalize scores across selected patches (instead of sigmoid).
+            # sigmoid(raw≈0)=0.5 was crushing patch magnitudes to half of CLS/Action,
+            # causing GPT-2 to ignore them.  Softmax keeps relative ranking while
+            # rescaling so mean gate ≈ 1.0 (no net attenuation).
+            gates_t = F.softmax(raw_t, dim=-1) * raw_t.shape[-1]
             weighted_t = patches_t * gates_t.unsqueeze(-1)
 
             weighted_chunks.append(weighted_t)
@@ -438,10 +474,12 @@ class PatchRouter(nn.Module):
             zeros_t = torch.zeros((bsz, 64, 768), device=clip_patches.device, dtype=clip_patches.dtype)
             zeros_i = torch.zeros((bsz, 64), device=clip_patches.device, dtype=torch.long)
             zeros_g = torch.zeros((bsz, 64), device=clip_patches.device, dtype=torch.long)
+            zeros_m = torch.zeros((bsz, 64), device=clip_patches.device, dtype=torch.bool)
             return {
                 "weighted_patches": zeros_t,
                 "patch_indices": zeros_i,
                 "patch_gop_ids": zeros_g,
+                "patch_valid_mask": zeros_m,
                 "raw_scores": raw,
                 "gate_mean": torch.tensor(0.0, device=clip_patches.device),
             }
@@ -451,7 +489,7 @@ class PatchRouter(nn.Module):
         cat_g = torch.cat(gop_chunks, dim=1)
         cat_m = torch.cat(mask_chunks, dim=1)
 
-        weighted, indices, gop_ids = self._pack_fixed(cat_t, cat_i, cat_g, cat_m, total=64)
+        weighted, indices, gop_ids, valid_mask = self._pack_fixed(cat_t, cat_i, cat_g, cat_m, total=64)
 
         gate_vals = []
         for gates_t, mk in zip(gate_chunks, mask_chunks):
@@ -465,21 +503,36 @@ class PatchRouter(nn.Module):
             "weighted_patches": weighted,
             "patch_indices": indices,
             "patch_gop_ids": gop_ids,
+            "patch_valid_mask": valid_mask,
             "raw_scores": raw,
             "gate_mean": gate_mean,
         }
 
 
 class ModalityProjector(nn.Module):
-    def __init__(self):
+    def __init__(self, zero_init_output: bool = False):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(768, 4096),
             nn.GELU(),
             nn.Linear(4096, 768),
         )
+        # Residual zero-init mode: at step 0, output = input (variance preserved).
+        # The MLP weights start at zero so it adds nothing initially, but gradient
+        # opens it as the model learns useful corrections. Without the residual
+        # connection, plain zero-init caused the projector to collapse to a
+        # near-constant function (input variance 4.27 -> output variance 1.09)
+        # because the loss-minimizing solution is "emit one useful vector for any
+        # input." That suppressed action token diversity AND starved the motion
+        # encoder of useful upstream gradient.
+        self.residual_mode = bool(zero_init_output)
+        if zero_init_output:
+            nn.init.zeros_(self.net[2].weight)
+            nn.init.zeros_(self.net[2].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.residual_mode:
+            return x + self.net(x)
         return self.net(x)
 
 
@@ -574,6 +627,9 @@ class FocalCapPhase2(nn.Module):
         cls_only: bool = False,
         use_agdtr: bool = True,
         block_dropout_p: float = 0.0,
+        block_dropout_cls_p: float = 0.0,
+        block_dropout_action_p: float = 0.0,
+        block_dropout_patch_p: float = 0.0,
         attn_probe_every: int = 200,
         action_prefix_mode: str = "region4",
     ):
@@ -584,9 +640,18 @@ class FocalCapPhase2(nn.Module):
         # whether action tokens contribute before testing the full pipeline.
         self.use_agdtr = bool(use_agdtr)
         self.block_dropout_p = float(block_dropout_p)
+        self.block_dropout_cls_p = float(block_dropout_cls_p)
+        self.block_dropout_action_p = float(block_dropout_action_p)
+        self.block_dropout_patch_p = float(block_dropout_patch_p)
         # Compute caption→visual attention attribution every N forward passes.
         # 0 disables. 200 is roughly once every ~7s on this hardware, negligible.
         self.attn_probe_every = int(attn_probe_every)
+        self.attn_aux_every = int(attn_aux_every)
+        self.attn_aux_target_share = float(attn_aux_target_share)
+        self.attn_aux_weight = float(attn_aux_weight)
+        # Delay regularization (dropout + attn-aux) until the model has learned
+        # a reasonable base captioning policy. This avoids early collapse.
+        self.regularizer_warmup_steps = max(int(regularizer_warmup_steps), 0)
         self._fwd_step = 0
         self.force_probe = False
         self.cls_only = bool(cls_only)
@@ -637,13 +702,14 @@ class FocalCapPhase2(nn.Module):
         else:
             self.action_prefix_tokens_per_gop = 4
 
-        # Per-block magnitude equalizers, applied AFTER the modality projector
-        # so each stream enters GPT-2 with O(1) std. Action Encoder output was
-        # ~6x louder than CLS pre-norm; GPT-2 attention then dampened it,
-        # causing CLS to absorb most attention mass.
-        self.cls_block_ln = nn.LayerNorm(768)
-        self.act_block_ln = nn.LayerNorm(768)
-        self.patch_block_ln = nn.LayerNorm(768)
+        # Freeze modules that won't be used (saves memory + ensures no stale gradients)
+        if not self.use_action_tokens:
+            self._freeze_module(self.action_encoder)
+            self._freeze_module(self.budget_allocator)
+            self._freeze_module(self.patch_router)
+        elif not self.use_spatial_tokens:
+            self._freeze_module(self.budget_allocator)
+            self._freeze_module(self.patch_router)
 
         self.temporal_embed = nn.Parameter(torch.randn(1, 8, 768) * 0.02)
         self.type_embed = nn.Parameter(torch.randn(1, 3, 768) * 0.02)
@@ -662,11 +728,12 @@ class FocalCapPhase2(nn.Module):
 
         self.using_lora = False
         if use_lora and _HAS_PEFT:
+            target_modules = list(lora_target_modules) if lora_target_modules else ["c_attn", "c_proj", "c_fc"]
             lora_cfg = LoraConfig(
-                r=16,
-                lora_alpha=32,
-                target_modules=["c_attn", "c_proj"],
-                lora_dropout=0.1,
+                r=int(lora_r),
+                lora_alpha=int(lora_alpha),
+                target_modules=target_modules,
+                lora_dropout=float(lora_dropout),
                 bias="none",
                 task_type="CAUSAL_LM",
                 fan_in_fan_out=True,
@@ -676,7 +743,15 @@ class FocalCapPhase2(nn.Module):
 
         self.gpt2 = base_gpt2
         self._freeze_module(self.gpt2)
-        if self.using_lora:
+        if full_gpt2_finetune:
+            # Keep PEFT wrapper/checkpoint compatibility, but allow full GPT-2
+            # optimization. LoRA adapters can optionally stay frozen.
+            for n, p in self.gpt2.named_parameters():
+                if "lora_" in n:
+                    p.requires_grad = bool(train_lora_during_full_finetune)
+                else:
+                    p.requires_grad = True
+        elif self.using_lora:
             for n, p in self.gpt2.named_parameters():
                 if "lora_" in n:
                     p.requires_grad = True
@@ -787,10 +862,11 @@ class FocalCapPhase2(nn.Module):
     def _build_visual_payload(
         self,
         clip_i_cls: torch.Tensor,
-        action_tokens: torch.Tensor,
-        weighted_patches: torch.Tensor,
-        patch_indices: torch.Tensor,
-        patch_gop_ids: torch.Tensor,
+        action_tokens: Optional[torch.Tensor] = None,
+        weighted_patches: Optional[torch.Tensor] = None,
+        patch_indices: Optional[torch.Tensor] = None,
+        patch_gop_ids: Optional[torch.Tensor] = None,
+        patch_valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz, gops, _ = clip_i_cls.shape
 
@@ -803,8 +879,11 @@ class FocalCapPhase2(nn.Module):
         patch_proj = self.patch_block_ln(patch_proj)
 
         t_embed = self.temporal_embed[:, :gops, :]
+        cls = cls_projected + t_embed + self.type_embed[:, 0:1, :]
 
-        cls = cls_proj + t_embed + self.type_embed[:, 0:1, :]
+        # CLS-only mode: no action or patch tokens
+        if not self.use_action_tokens or action_tokens is None:
+            return cls
 
         patch_temporal = torch.gather(
             t_embed.expand(bsz, -1, -1),
@@ -816,7 +895,9 @@ class FocalCapPhase2(nn.Module):
             dim=1,
             index=patch_indices.unsqueeze(-1).expand(-1, -1, 768),
         )
-        patch = patch_proj + patch_temporal + self.type_embed[:, 2:3, :] + patch_spatial
+        patch = patch_projected + patch_temporal + self.type_embed[:, 2:3, :] + patch_spatial
+        if patch_valid_mask is not None:
+            patch = patch * patch_valid_mask.unsqueeze(-1).to(dtype=patch.dtype)
 
         if self.action_prefix_mode == "fused_cls":
             cls_action = cls
@@ -1172,6 +1253,10 @@ class FocalCapPhase2(nn.Module):
         inputs_embeds = torch.cat([visual, vis_end, text_embeds], dim=1)
 
         vis_mask = torch.ones((bsz, visual.shape[1] + 1), dtype=attention_mask.dtype, device=attention_mask.device)
+        if self.use_action_tokens and self.use_spatial_tokens and routed is not None and "patch_valid_mask" in routed:
+            patch_start = gops + gops * self.action_tokens_per_gop
+            patch_end = patch_start + routed["patch_valid_mask"].shape[1]
+            vis_mask[:, patch_start:patch_end] = routed["patch_valid_mask"].to(dtype=vis_mask.dtype)
         text_mask = torch.cat([torch.ones((bsz, 1), dtype=attention_mask.dtype, device=attention_mask.device), attention_mask], dim=1)
         full_mask = torch.cat([vis_mask, text_mask], dim=1)
 
@@ -1248,6 +1333,7 @@ class FocalCapPhase2(nn.Module):
             "budget_mean": budget_mean,
             "budget_std": budget_std,
             "patch_diversity": patch_diversity,
+            "patch_valid_ratio": patch_valid_ratio,
             "cls_norm_post": cls_norm_post,
             "act_norm_post": act_norm_post,
             "patch_norm_post": patch_norm_post,
@@ -1385,6 +1471,10 @@ class FocalCapPhase2(nn.Module):
 
         prefix = torch.cat([visual, vis_end, bos_emb], dim=1)
         prefix_mask = torch.ones((bsz, prefix.shape[1]), dtype=torch.long, device=clip_i_cls.device)
+        if self.use_action_tokens and self.use_spatial_tokens and routed is not None and "patch_valid_mask" in routed:
+            patch_start = gops + gops * self.action_tokens_per_gop
+            patch_end = patch_start + routed["patch_valid_mask"].shape[1]
+            prefix_mask[:, patch_start:patch_end] = routed["patch_valid_mask"].to(dtype=prefix_mask.dtype)
 
         return self.gpt2.generate(
             inputs_embeds=prefix,

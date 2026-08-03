@@ -242,22 +242,22 @@ def _read_frames_cv2_by_index(video_path: str, frame_indices: list[int]) -> torc
     """Read exact frame indices with cv2 as a fallback when decord random access fails."""
     import cv2
 
+    frames = []
     with _suppress_c_stderr():
         cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"cv2.VideoCapture cannot open video file: {video_path}")
+        if not cap.isOpened():
+            raise RuntimeError(f"cv2.VideoCapture cannot open video file: {video_path}")
 
-    frames = []
-    try:
-        for idx in frame_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ok, frame_bgr = cap.read()
-            if not ok or frame_bgr is None:
-                raise RuntimeError(f"cv2 failed to decode frame {idx} from {video_path}")
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            frames.append(torch.from_numpy(frame_rgb))
-    finally:
-        cap.release()
+        try:
+            for idx in frame_indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+                ok, frame_bgr = cap.read()
+                if not ok or frame_bgr is None:
+                    raise RuntimeError(f"cv2 failed to decode frame {idx} from {video_path}")
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frames.append(torch.from_numpy(frame_rgb))
+        finally:
+            cap.release()
 
     return torch.stack(frames)  # [N, H, W, 3], uint8
 
@@ -578,8 +578,8 @@ def read_frames_compressed_domain(
         return ret, True
 
     except Exception as e:
-        # Quiet, single-line warning instead of full traceback. The dataset's outer
-        # `Skipping invalid compressed-video sample` warning gives the same info with
-        # de-duplication; a few corrupt MP4s in the corpus are expected.
-        logger.warning("video read failed for %s: %s: %s", video_path, type(e).__name__, e)
+        # The dataset's fast estimator overestimates valid GOPs for videos encoded
+        # with very short GOP structures. When this fails, dataset_vatex.py catches
+        # it and gracefully skips the video. We silently raise here to avoid spamming
+        # the console with alarming errors for expected behavior.
         raise

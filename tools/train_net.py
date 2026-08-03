@@ -25,9 +25,53 @@ def train(
     val_dataloader: DataLoader,
     trainer: pl.Trainer,
     ckpt_path: str = None,
+    weights_only_ckpt: str = "",
+    auto_fallback_weights_only_on_optim_mismatch: bool = True,
 ):
     if ckpt_path is None:
         ckpt_path = os.environ.get("CKPT_PATH")
+
+    # Guard: if the run dir already has Lightning checkpoints and no ckpt_path /
+    # weights_only_ckpt was supplied, the user is about to silently restart from
+    # scratch into an existing experiment directory (the polish-run footgun).
+    run_dir = getattr(trainer, "default_root_dir", "") or ""
+    if run_dir and not ckpt_path and not weights_only_ckpt:
+        latest_dir = os.path.join(run_dir, "checkpoints", "latest")
+        best_dir = os.path.join(run_dir, "checkpoints", "best")
+        prior = []
+        for d in (latest_dir, best_dir):
+            if os.path.isdir(d):
+                prior.extend(p for p in os.listdir(d) if p.endswith(".ckpt"))
+        if prior:
+            raise RuntimeError(
+                f"Run dir already contains checkpoints ({len(prior)} found under "
+                f"{run_dir}/checkpoints/) but no ckpt_path was provided. Refusing "
+                f"to silently restart from scratch and overwrite them. Either pass "
+                f"ckpt_path=<…/last.ckpt> to resume, weights_only_ckpt=<…> to warm "
+                f"start, or change trainer.default_root_dir to a fresh path."
+            )
+
+    if weights_only_ckpt:
+        raw = torch.load(weights_only_ckpt, map_location="cpu", weights_only=False)
+        state = raw.get("state_dict", raw)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        logger.info(
+            "Loaded weights_only_ckpt=%s (missing=%d unexpected=%d)",
+            weights_only_ckpt,
+            len(missing),
+            len(unexpected),
+        )
+        ckpt_path = None
+
+    # Trigger LightningModule.setup() now so motion checkpoint load + the
+    # tune_motion_encoder flip happen BEFORE the summary print and BEFORE
+    # configure_optimizers fires inside trainer.fit(). Without this the
+    # summary shows pre-setup state (motion frozen) even when the flag is on.
+    if hasattr(model, "setup"):
+        try:
+            model.setup("fit")
+        except Exception as exc:
+            logger.warning("model.setup('fit') failed: %s", exc)
 
     try:
         from torchinfo import summary
@@ -40,12 +84,64 @@ def train(
     except Exception as exc:
         logger.warning("Could not print model summary: %s", exc)
 
-    trainer.fit(
-        model=model,
-        train_dataloaders=train_dataloader,
-        val_dataloaders=val_dataloader,
-        ckpt_path=ckpt_path,
-    )
+    try:
+        trainer.fit(
+            model=model,
+            train_dataloaders=train_dataloader,
+            val_dataloaders=val_dataloader,
+            ckpt_path=ckpt_path,
+        )
+    except (ValueError, RuntimeError) as exc:
+        msg = str(exc)
+        is_optimizer_group_mismatch = "different number of parameter groups" in msg
+        is_model_key_mismatch = (
+            "Missing key(s) in state_dict" in msg
+            or "Unexpected key(s) in state_dict" in msg
+            or "size mismatch for" in msg
+        )
+        can_fallback = (
+            auto_fallback_weights_only_on_optim_mismatch
+            and ckpt_path
+            and (is_optimizer_group_mismatch or is_model_key_mismatch)
+        )
+        if not can_fallback:
+            raise
+
+        logger.warning(
+            "Resume failed due to checkpoint-state mismatch. "
+            "Falling back to weights-only load from ckpt_path=%s and restarting optimizer/scheduler state.",
+            ckpt_path,
+        )
+        raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = raw.get("state_dict", raw)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        logger.info(
+            "Fallback weights-only load complete (missing=%d unexpected=%d). Retrying fit with ckpt_path=None.",
+            len(missing),
+            len(unexpected),
+        )
+        # Important: clear Trainer-side checkpoint path state set by the failed
+        # resume attempt. Otherwise Lightning may try to restore again even when
+        # we pass ckpt_path=None on this second fit call.
+        try:
+            trainer.ckpt_path = None
+        except Exception:
+            pass
+        if hasattr(trainer, "_checkpoint_connector"):
+            try:
+                trainer._checkpoint_connector._ckpt_path = None
+            except Exception:
+                pass
+            try:
+                trainer._checkpoint_connector._user_managed = False
+            except Exception:
+                pass
+        trainer.fit(
+            model=model,
+            train_dataloaders=train_dataloader,
+            val_dataloaders=val_dataloader,
+            ckpt_path=None,
+        )
 
 
 if __name__ == "__main__":

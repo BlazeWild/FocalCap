@@ -1,0 +1,38 @@
+# @package _global_
+#
+# Subset CLS-only baseline. Use as the reference number that the full-token run
+# must beat. Override max_videos_per_split on CLI to pick a fraction.
+#
+# Example (50% of train, 50% of val on WSL2):
+#   python tools/train_net.py +exp/train=vatex_cls_subset \
+#       train_dataloader.dataset.max_videos_per_split=12500 \
+#       val_dataloader.dataset.max_videos_per_split=1500
+
+defaults:
+  - /train
+  - /dataset@train_dataloader.dataset: vatex
+  - /dataset@val_dataloader.dataset: vatex
+  - /exp/train/base
+  - _self_
+
+trainer:
+  default_root_dir: "./logs/vatex_captioning/cls_subset_baseline"
+  max_epochs: 8
+
+model:
+  cocap_model:
+    use_action_tokens: false
+    use_spatial_tokens: false
+    # Pin LoRA to the historical baseline setup (r=16, c_attn+c_proj only).
+    # The bigger LoRA used for full-token runs over-parameterizes the
+    # single-stream CLS-only prefix and hurts CIDEr on small subsets.
+    lora_r: 16
+    lora_alpha: 32
+    lora_target_modules: ["c_attn", "c_proj"]
+    # Disable regularizers we don't need with single-stream prefix.
+    block_dropout_p: 0.0
+    block_dropout_cls_p: 0.0
+    block_dropout_action_p: 0.0
+    block_dropout_patch_p: 0.0
+    attn_aux_every: 0
+    regularizer_warmup_steps: 0
